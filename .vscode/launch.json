@@ -5,10 +5,10 @@
             "name": "C++ Launch",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/boost-websocket",
+            "program": "${workspaceFolder}/websocketpp",
             "cwd": "${workspaceFolder}",
-            "args": ["ws-feed.pro.coinbase.com", "443", "Hello, world!"],
-            "stopAtEntry": true,
+            "args": [],
+            "stopAtEntry": false,
         }
     ]
 }

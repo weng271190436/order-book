@@ -1,4 +1,4 @@
-CXXFLAGS = -std=c++17 -Wall -g
+CXXFLAGS = -std=c++20 -Wall -g
 LDLIBS = -lstdc++ -lssl -lcrypto
 LDFLAGS = -L/usr/local/ssl/lib
 .PHONY: all clean
