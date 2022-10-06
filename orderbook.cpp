@@ -178,6 +178,6 @@ int main(int argc, char* argv[]) {
     }
     while (true) {
         display_order_book();
-        sleep(2);
+        sleep(1);
     }
 }
