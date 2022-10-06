@@ -1,6 +1,7 @@
 #include <websocketpp/config/asio_client.hpp>
 #include <websocketpp/client.hpp>
 #include <nlohmann/json.hpp>
+#include <httpserver.hpp>
 
 #include <iostream>
 #include <set>
@@ -17,6 +18,9 @@ using json = nlohmann::json;
 
 typedef websocketpp::config::asio_client::message_type::ptr message_ptr;
 
+const int MAX_DISPLAY_NUM = 10;
+const int DOUBLE_DISPLAY_PRECISION = 10;
+
 struct order_book {
     std::map<double, double, std::greater<double>> bids;
     std::map<double, double> asks;
@@ -24,7 +28,26 @@ struct order_book {
 
 order_book b;
 std::string product_id = "BTC-USD";
-std::mutex m;
+std::mutex bid_mutex;
+std::mutex ask_mutex;
+
+std::string double_to_string(double d) {
+    std::string s;
+    std::stringstream sstream;
+    sstream.setf(std::ios::fixed);
+    sstream.precision(DOUBLE_DISPLAY_PRECISION);
+    sstream << d;
+    s = sstream.str();
+    return s;
+}
+
+void print_green_line(std::string text) {
+    std::cout << "\033[32m" << text << "\033[0m" << std::endl;
+}
+
+void print_red_line(std::string text) {
+    std::cout << "\033[31m" << text << "\033[0m" << std::endl;
+}
 
 void print_yellow_line(std::string text) {
     std::cout << "\033[33m" << text << "\033[0m" << std::endl;
@@ -46,14 +69,14 @@ void on_message(client* c, websocketpp::connection_hdl hdl, message_ptr msg) {
     json message = json::parse(msg->get_payload());
     if (message["type"] == "snapshot") {
         for (auto it = message["bids"].begin(); it != message["bids"].end(); ++it) {
-            m.lock();
+            bid_mutex.lock();
             b.bids[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
-            m.unlock();
+            bid_mutex.unlock();
         }
         for (auto it = message["asks"].begin(); it != message["asks"].end(); ++it) {
-            m.lock();
+            ask_mutex.lock();
             b.asks[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
-            m.unlock();
+            ask_mutex.unlock();
         }
     } else if (message["type"] == "l2update") {
         for (auto it = message["changes"].begin(); it != message["changes"].end(); ++it) {
@@ -61,21 +84,21 @@ void on_message(client* c, websocketpp::connection_hdl hdl, message_ptr msg) {
             double price = std::stod(it.value()[1].get<std::string>());
             double size = std::stod(it.value()[2].get<std::string>());
             if (side == "buy") {
-                m.lock();
+                bid_mutex.lock();
                 if (size == 0) {
                     b.bids.erase(price);
                 } else {
                     b.bids[price] = size;
                 }
-                m.unlock();
+                bid_mutex.unlock();
             } else if (side == "sell") {
-                m.lock();
+                ask_mutex.lock();
                 if (size == 0) {
                     b.asks.erase(price);
                 } else {
                     b.asks[price] = size;
                 }
-                m.unlock();
+                ask_mutex.unlock();
             }
         }
     } else if (message["type"] == "heartbeat") {
@@ -129,41 +152,71 @@ void *start_order_book(void *arg) {
     return NULL;
 }
 
-std::string double_to_string(double d) {
-    std::string s;
-    std::stringstream sstream;
-    sstream.setf(std::ios::fixed);
-    sstream.precision(10);
-    sstream << d;
-    s = sstream.str();
-    return s;
-}
-
-void print_green_line(std::string text) {
-    std::cout << "\033[32m" << text << "\033[0m" << std::endl;
-}
-
-void print_red_line(std::string text) {
-    std::cout << "\033[31m" << text << "\033[0m" << std::endl;
-}
-
 void display_order_book() {
-    int max_display_num = 10;
-    print_green_line("bids");
+    int display_num = MAX_DISPLAY_NUM;
+    print_green_line(product_id + " bids");
+    bid_mutex.lock();
     for (auto it = b.bids.begin(); it != b.bids.end(); ++it) {
-        if (max_display_num-- == 0) {
+        if (display_num-- == 0) {
             break;
         }
         print_green_line(double_to_string(it->first) + " " + double_to_string(it->second));
     }
-    max_display_num = 10;
-    print_red_line("asks");
+    bid_mutex.unlock();
+    display_num = MAX_DISPLAY_NUM;
+    print_red_line(product_id + " asks");
+    ask_mutex.lock();
     for (auto it = b.asks.begin(); it != b.asks.end(); ++it) {
-        if (max_display_num-- == 0) {
+        if (display_num-- == 0) {
             break;
         }
         print_red_line(double_to_string(it->first) + " " + double_to_string(it->second));
     }
+    ask_mutex.unlock();
+}
+
+std::string get_order_book_string() {
+    std::string s;
+    std::stringstream sstream;
+    int display_num = MAX_DISPLAY_NUM;
+    sstream << product_id << " bids\n--------------------" << std::endl;
+    bid_mutex.lock();
+    for (auto it = b.bids.begin(); it != b.bids.end(); ++it) {
+        if (display_num-- == 0) {
+            break;
+        }
+        sstream << double_to_string(it->first) << " " << double_to_string(it->second) << std::endl;
+    }
+    bid_mutex.unlock();
+    sstream << std::endl;
+    display_num = MAX_DISPLAY_NUM;
+    sstream << product_id << " asks\n--------------------" << std::endl;
+    ask_mutex.lock();
+    for (auto it = b.asks.begin(); it != b.asks.end(); ++it) {
+        if (display_num-- == 0) {
+            break;
+        }
+        sstream << double_to_string(it->first) << " " << double_to_string(it->second) << std::endl;
+    }
+    ask_mutex.unlock();
+    sstream << std::endl;
+    s = sstream.str();
+    return s;
+}
+
+class order_book_resource : public httpserver::http_resource {
+public:
+    std::shared_ptr<httpserver::http_response> render(const httpserver::http_request&) {
+        return std::shared_ptr<httpserver::http_response>(new httpserver::string_response(get_order_book_string()));
+    }
+};
+
+void *start_http_server(void *arg) {
+    httpserver::webserver ws = httpserver::create_webserver(8080);
+    order_book_resource obr;
+    ws.register_resource("/orderbook", &obr);
+    ws.start(true);
+    return NULL;
 }
 
 int main(int argc, char* argv[]) {
@@ -171,13 +224,20 @@ int main(int argc, char* argv[]) {
         product_id = argv[1];
     }
 
-    pthread_t t1;
-    int res = pthread_create(&t1, NULL, start_order_book, NULL);
+    pthread_t t_order_book;
+    int res = pthread_create(&t_order_book, NULL, start_order_book, NULL);
     if (res) {
-        std::cout << "error: " << res << std::endl; 
+        std::cout << "thread order book error: " << res << std::endl; 
     }
+
+    pthread_t t_http_server;
+    res = pthread_create(&t_http_server, NULL, start_http_server, NULL);
+    if (res) {
+        std::cout << "thread http server error: " << res << std::endl; 
+    }
+
     while (true) {
-        display_order_book();
         sleep(1);
+        display_order_book();
     }
 }

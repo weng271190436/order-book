@@ -3,6 +3,9 @@
         "*.rmd": "markdown",
         "chrono": "cpp",
         "ostream": "cpp",
-        "set": "cpp"
+        "set": "cpp",
+        "*.ipp": "cpp",
+        "*.tcc": "cpp",
+        "variant": "cpp"
     }
 }
