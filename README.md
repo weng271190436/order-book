@@ -1,6 +1,12 @@
 # order-book
 Construct an order book using Coinbase websocket API to learn some C++
 
+It has one thread connecting to Coinbase websocket API to get market data and construct order book.
+
+It has another thread running an HTTP server to display the order book.
+
+The main thread displays the order book at one-second interval.
+
 ## Dependencies
 sudo apt-get install libssl-dev
 
