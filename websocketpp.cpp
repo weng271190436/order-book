@@ -26,8 +26,12 @@ order_book b;
 std::string product_id = "BTC-USD";
 std::mutex m;
 
+void print_yellow_line(std::string text) {
+    std::cout << "\033[33m" << text << "\033[0m" << std::endl;
+}
+
 void on_open(client* c, websocketpp::connection_hdl hdl) {
-    std::cout << "on_open" << std::endl;
+    print_yellow_line("on open");
     websocketpp::lib::error_code ec;
     std::ostringstream ss;
     ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
@@ -39,28 +43,20 @@ void on_open(client* c, websocketpp::connection_hdl hdl) {
 }
 
 void on_message(client* c, websocketpp::connection_hdl hdl, message_ptr msg) {
-    // std::cout << "on_message called with hdl: " << hdl.lock().get()
-    //           << " and message: " << msg->get_payload()
-    //           << std::endl;
-
     json message = json::parse(msg->get_payload());
     if (message["type"] == "snapshot") {
         for (auto it = message["bids"].begin(); it != message["bids"].end(); ++it) {
-            // std::cout << product_id << " bid: price " << std::stod(it.value()[0].get<std::string>()) << " size " << std::stod(it.value()[1].get<std::string>()) << std::endl;
             m.lock();
             b.bids[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
             m.unlock();
         }
         for (auto it = message["asks"].begin(); it != message["asks"].end(); ++it) {
-            // std::cout << product_id << " ask: price " << std::stod(it.value()[0].get<std::string>()) << " size " << std::stod(it.value()[1].get<std::string>()) << std::endl;
             m.lock();
             b.asks[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
             m.unlock();
         }
     } else if (message["type"] == "l2update") {
-        // std::cout << message << std::endl;
         for (auto it = message["changes"].begin(); it != message["changes"].end(); ++it) {
-            // std::cout << product_id << " change: " << it.value()[0].get<std::string>() << " price " << std::stod(it.value()[1].get<std::string>()) << " size " << std::stod(it.value()[2].get<std::string>()) << std::endl;
             std::string side = it.value()[0].get<std::string>();
             double price = std::stod(it.value()[1].get<std::string>());
             double size = std::stod(it.value()[2].get<std::string>());
@@ -83,11 +79,11 @@ void on_message(client* c, websocketpp::connection_hdl hdl, message_ptr msg) {
             }
         }
     } else if (message["type"] == "heartbeat") {
-        std::cout << "heartbeat" << std::endl;
+        print_yellow_line("heartbeat");
     } else if (message["type"] == "subscriptions") {
-        std::cout << "subscriptions" << std::endl;
+        print_yellow_line("subscriptions");
     } else {
-        std::cout << "unknown message type" << std::endl;
+        print_yellow_line("unknown message type");
     }
 }
 
@@ -133,6 +129,43 @@ void *start_order_book(void *arg) {
     return NULL;
 }
 
+std::string double_to_string(double d) {
+    std::string s;
+    std::stringstream sstream;
+    sstream.setf(std::ios::fixed);
+    sstream.precision(10);
+    sstream << d;
+    s = sstream.str();
+    return s;
+}
+
+void print_green_line(std::string text) {
+    std::cout << "\033[32m" << text << "\033[0m" << std::endl;
+}
+
+void print_red_line(std::string text) {
+    std::cout << "\033[31m" << text << "\033[0m" << std::endl;
+}
+
+void display_order_book() {
+    int max_display_num = 10;
+    print_green_line("bids");
+    for (auto it = b.bids.begin(); it != b.bids.end(); ++it) {
+        if (max_display_num-- == 0) {
+            break;
+        }
+        print_green_line(double_to_string(it->first) + " " + double_to_string(it->second));
+    }
+    max_display_num = 10;
+    print_red_line("asks");
+    for (auto it = b.asks.begin(); it != b.asks.end(); ++it) {
+        if (max_display_num-- == 0) {
+            break;
+        }
+        print_red_line(double_to_string(it->first) + " " + double_to_string(it->second));
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc == 2) {
         product_id = argv[1];
@@ -143,5 +176,8 @@ int main(int argc, char* argv[]) {
     if (res) {
         std::cout << "error: " << res << std::endl; 
     }
-    sleep(10);
+    while (true) {
+        display_order_book();
+        sleep(2);
+    }
 }
