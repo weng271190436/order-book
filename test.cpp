@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <assert.h>
 #include <poll.h>
+#include <arpa/inet.h>
 
 typedef std::unordered_map<std::string, std::string> headers;
 typedef int socket_t;
@@ -37,6 +38,22 @@ const std::string kDefaultCiphers =
 
 using CancellationRequest = std::function<bool()>;
 using SelectInterruptPtr = std::unique_ptr<class SelectInterrupt>;
+
+struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string& errMsg) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    std::string sport = std::to_string(port);
+    struct addrinfo* res;
+    int getaddrinfo_result = getaddrinfo(hostname.c_str(), sport.c_str(), &hints, &res);
+    if (getaddrinfo_result) {
+        errMsg = gai_strerror(getaddrinfo_result);
+        res = nullptr;
+    }
+    return res;
+};
 
 class SelectInterrupt {
 public:
@@ -166,183 +183,6 @@ const int SelectInterruptPipe::kPipeWriteIndex = 1;
 SelectInterruptPtr createSelectInterrupt() {
     return std::unique_ptr<SelectInterruptPipe>(new SelectInterruptPipe());
 }
-
-class DNSLookup : public std::enable_shared_from_this<DNSLookup> {
-public:
-    DNSLookup(const std::string& hostname, int port, int64_t wait = DNSLookup::kDefaultWait)
-        : _hostname(hostname)
-        , _port(port)
-        , _wait(wait)
-        , _res(nullptr)
-        , _done(false)
-    {
-        ;
-    };
-    ~DNSLookup() = default;
-
-    struct addrinfo* resolve(std::string& errMsg,
-                                    const CancellationRequest& isCancellationRequested,
-                                    bool cancellable = true)
-    {
-        return cancellable ? resolveCancellable(errMsg, isCancellationRequested)
-                            : resolveUnCancellable(errMsg, isCancellationRequested);
-    };
-
-    void release(struct addrinfo* addr)
-    {
-        freeaddrinfo(addr);
-    };
-
-private:
-    struct addrinfo* resolveCancellable(
-        std::string& errMsg, const CancellationRequest& isCancellationRequested)
-    {
-        errMsg = "no error";
-
-        // Can only be called once, otherwise we would have to manage a pool
-        // of background thread which is overkill for our usage.
-        if (_done)
-        {
-            return nullptr; // programming error, create a second DNSLookup instance
-                            // if you need a second lookup.
-        }
-
-        //
-        // Good resource on thread forced termination
-        // https://www.bo-yang.net/2017/11/19/cpp-kill-detached-thread
-        //
-        auto ptr = shared_from_this();
-        std::weak_ptr<DNSLookup> self(ptr);
-
-        int port = _port;
-        std::string hostname(_hostname);
-
-        // We make the background thread doing the work a shared pointer
-        // instead of a member variable, because it can keep running when
-        // this object goes out of scope, in case of cancellation
-        auto t = std::make_shared<std::thread>(&DNSLookup::run, this, self, hostname, port);
-        t->detach();
-
-        while (!_done)
-        {
-            // Wait for 1 milliseconds, to see if the bg thread has terminated.
-            // We do not use a condition variable to wait, as destroying this one
-            // if the bg thread is alive can cause undefined behavior.
-            std::this_thread::sleep_for(std::chrono::milliseconds(_wait));
-
-            // Were we cancelled ?
-            if (isCancellationRequested())
-            {
-                errMsg = "cancellation requested";
-                return nullptr;
-            }
-        }
-
-        // Maybe a cancellation request got in before the bg terminated ?
-        if (isCancellationRequested())
-        {
-            errMsg = "cancellation requested";
-            return nullptr;
-        }
-
-        errMsg = getErrMsg();
-        return getRes();
-    }
-
-    struct addrinfo* resolveUnCancellable(
-        std::string& errMsg, const CancellationRequest& isCancellationRequested)
-    {
-        errMsg = "no error";
-
-        // Maybe a cancellation request got in before the background thread terminated ?
-        if (isCancellationRequested())
-        {
-            errMsg = "cancellation requested";
-            return nullptr;
-        }
-
-        return getAddrInfo(_hostname, _port, errMsg);
-    };
-
-    static struct addrinfo* getAddrInfo(const std::string& hostname,
-                                        int port,
-                                        std::string& errMsg) {
-        struct addrinfo hints;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-
-        std::string sport = std::to_string(port);
-
-        struct addrinfo* res;
-        int getaddrinfo_result = getaddrinfo(hostname.c_str(), sport.c_str(), &hints, &res);
-        if (getaddrinfo_result)
-        {
-            errMsg = gai_strerror(getaddrinfo_result);
-            res = nullptr;
-        }
-        return res;
-    };
-
-    void run(std::weak_ptr<DNSLookup> self,
-                        std::string hostname,
-                        int port) // thread runner
-    {
-        // We don't want to read or write into members variables of an object that could be
-        // gone, so we use temporary variables (res) or we pass in by copy everything that
-        // getAddrInfo needs to work.
-        std::string errMsg;
-        struct addrinfo* res = getAddrInfo(hostname, port, errMsg);
-
-        if (auto lock = self.lock())
-        {
-            // Copy result into the member variables
-            setRes(res);
-            setErrMsg(errMsg);
-
-            _done = true;
-        }
-    };
-
-    void setErrMsg(const std::string& errMsg)
-    {
-        std::lock_guard<std::mutex> lock(_errMsgMutex);
-        _errMsg = errMsg;
-    };
-    const std::string& getErrMsg()
-    {
-        std::lock_guard<std::mutex> lock(_errMsgMutex);
-        return _errMsg;
-    };
-
-    void setRes(struct addrinfo* addr)
-    {
-        std::lock_guard<std::mutex> lock(_resMutex);
-        _res = addr;
-    };
-    struct addrinfo* getRes()
-    {
-        std::lock_guard<std::mutex> lock(_resMutex);
-        return _res;
-    };
-
-    std::string _hostname;
-    int _port;
-    int64_t _wait;
-    const static int64_t kDefaultWait;
-
-    struct addrinfo* _res;
-    std::mutex _resMutex;
-
-    std::string _errMsg;
-    std::mutex _errMsgMutex;
-
-    std::atomic<bool> _done;
-};
-
-const int64_t DNSLookup::kDefaultWait = 1; // ms
-
 
 struct SocketTLSOptions {
 public:
@@ -902,8 +742,8 @@ private:
         //
         // First do DNS resolution
         //
-        auto dnsLookup = std::make_shared<DNSLookup>(hostname, port);
-        struct addrinfo* res = dnsLookup->resolve(errMsg, isCancellationRequested);
+        std::string dns_err_msg;
+        struct addrinfo* res = resolve_dns(hostname, port, dns_err_msg);
         if (res == nullptr) {
             return -1;
         }
@@ -1429,9 +1269,8 @@ int main() {
     int port;
     c.parse_url(protocol, host, port, url);
 
-    DNSLookup dns_lookup(host, port);
-    std::string err_msg;
-    CancellationRequest cancellation_request;
-    addrinfo* address_info = dns_lookup.resolve(err_msg, cancellation_request);
-    std::cout << "address_info: " << address_info << std::endl;
+    std::string dns_err_msg;
+    struct addrinfo* address_info = resolve_dns(host, port, dns_err_msg);
+    struct sockaddr_in* addr = (struct sockaddr_in *)address_info->ai_addr; 
+    std::cout << "inet_ntoa(in_addr)sin = " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
 }
