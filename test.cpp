@@ -7,6 +7,9 @@
 #include <mutex>
 #include <atomic>
 #include <cstring>
+#include <thread>
+#include <fstream>
+#include <sstream>
 
 #include <openssl/bio.h>
 #include <openssl/conf.h>
@@ -15,8 +18,14 @@
 #include <openssl/ssl.h>
 #include <fnmatch.h>
 #include <netdb.h>
+#include <unistd.h>
+#include <netinet/tcp.h>
+#include <fcntl.h>
+#include <assert.h>
+#include <poll.h>
 
 typedef std::unordered_map<std::string, std::string> headers;
+typedef int socket_t;
 
 const std::string kDefaultCiphers =
     "ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA-AES128-SHA "
@@ -27,9 +36,9 @@ const std::string kDefaultCiphers =
     "DHE-RSA-AES256-SHA DHE-RSA-AES128-SHA256 DHE-RSA-AES256-SHA256 AES128-SHA";
 
 using CancellationRequest = std::function<bool()>;
+using SelectInterruptPtr = std::unique_ptr<class SelectInterrupt>;
 
-class SelectInterrupt
-{
+class SelectInterrupt {
 public:
     SelectInterrupt() {};
     ~SelectInterrupt() {};
@@ -49,9 +58,118 @@ public:
 const uint64_t SelectInterrupt::kSendRequest = 1;
 const uint64_t SelectInterrupt::kCloseRequest = 2;
 
+class SelectInterruptPipe final : public SelectInterrupt {
+public:
+    SelectInterruptPipe() {
+        _fildes[kPipeReadIndex] = -1;
+        _fildes[kPipeWriteIndex] = -1;
+    }
+
+    ~SelectInterruptPipe() {
+        ::close(_fildes[kPipeReadIndex]);
+        ::close(_fildes[kPipeWriteIndex]);
+        _fildes[kPipeReadIndex] = -1;
+        _fildes[kPipeWriteIndex] = -1;
+    }
+
+    bool init(std::string& errorMsg) {
+        std::lock_guard<std::mutex> lock(_fildesMutex);
+        // calling init twice is a programming error
+        assert(_fildes[kPipeReadIndex] == -1);
+        assert(_fildes[kPipeWriteIndex] == -1);
+
+        if (pipe(_fildes) < 0) {
+            std::stringstream ss;
+            ss << "SelectInterruptPipe::init() failed in pipe() call"
+               << " : " << strerror(errno);
+            errorMsg = ss.str();
+            return false;
+        }
+
+        if (fcntl(_fildes[kPipeReadIndex], F_SETFL, O_NONBLOCK) == -1) {
+            std::stringstream ss;
+            ss << "SelectInterruptPipe::init() failed in fcntl(..., O_NONBLOCK) call"
+               << " : " << strerror(errno);
+            errorMsg = ss.str();
+
+            _fildes[kPipeReadIndex] = -1;
+            _fildes[kPipeWriteIndex] = -1;
+            return false;
+        }
+
+        if (fcntl(_fildes[kPipeWriteIndex], F_SETFL, O_NONBLOCK) == -1) {
+            std::stringstream ss;
+            ss << "SelectInterruptPipe::init() failed in fcntl(..., O_NONBLOCK) call"
+               << " : " << strerror(errno);
+            errorMsg = ss.str();
+
+            _fildes[kPipeReadIndex] = -1;
+            _fildes[kPipeWriteIndex] = -1;
+            return false;
+        }
+
+        return true;
+    }
+
+    bool notify(uint64_t value) {
+        std::lock_guard<std::mutex> lock(_fildesMutex);
+
+        int fd = _fildes[kPipeWriteIndex];
+        if (fd == -1) return false;
+
+        ssize_t ret = -1;
+        do{
+            ret = ::write(fd, &value, sizeof(value));
+        } while (ret == -1 && errno == EINTR);
+
+        // we should write 8 bytes for an uint64_t
+        return ret == 8;
+    }
+
+    uint64_t read() {
+        std::lock_guard<std::mutex> lock(_fildesMutex);
+        int fd = _fildes[kPipeReadIndex];
+        uint64_t value = 0;
+        ssize_t ret = -1;
+        do {
+            ret = ::read(fd, &value, sizeof(value));
+        } while (ret == -1 && errno == EINTR);
+        return value;
+    }
+
+    bool clear() {
+        return true;
+    }
+
+    int getFd() const {
+        std::lock_guard<std::mutex> lock(_fildesMutex);
+        return _fildes[kPipeReadIndex];
+    }
+
+private:
+    // Store file descriptors used by the communication pipe. Communication
+    // happens between a control thread and a background thread, which is
+    // blocked on select.
+    int _fildes[2];
+    mutable std::mutex _fildesMutex;
+
+    // Used to identify the read/write idx
+    static const int kPipeReadIndex;
+    static const int kPipeWriteIndex;
+};
+
+// File descriptor at index 0 in _fildes is the read end of the pipe
+// File descriptor at index 1 in _fildes is the write end of the pipe
+const int SelectInterruptPipe::kPipeReadIndex = 0;
+const int SelectInterruptPipe::kPipeWriteIndex = 1;
+
+SelectInterruptPtr createSelectInterrupt() {
+    return std::unique_ptr<SelectInterruptPipe>(new SelectInterruptPipe());
+}
+
 class DNSLookup : public std::enable_shared_from_this<DNSLookup> {
 public:
-    DNSLookup(const std::string& hostname, int port, int64_t wait)
+    DNSLookup(const std::string& hostname, int port, int64_t wait = DNSLookup::kDefaultWait)
         : _hostname(hostname)
         , _port(port)
         , _wait(wait)
@@ -63,16 +181,88 @@ public:
     ~DNSLookup() = default;
 
     struct addrinfo* resolve(std::string& errMsg,
-                                const CancellationRequest& isCancellationRequested,
-                                bool cancellable = true);
+                                    const CancellationRequest& isCancellationRequested,
+                                    bool cancellable = true)
+    {
+        return cancellable ? resolveCancellable(errMsg, isCancellationRequested)
+                            : resolveUnCancellable(errMsg, isCancellationRequested);
+    };
 
-    void release(struct addrinfo* addr);
+    void release(struct addrinfo* addr)
+    {
+        freeaddrinfo(addr);
+    };
 
 private:
-    struct addrinfo* resolveCancellable(std::string& errMsg,
-                                        const CancellationRequest& isCancellationRequested);
-    struct addrinfo* resolveUnCancellable(std::string& errMsg,
-                                            const CancellationRequest& isCancellationRequested);
+    struct addrinfo* resolveCancellable(
+        std::string& errMsg, const CancellationRequest& isCancellationRequested)
+    {
+        errMsg = "no error";
+
+        // Can only be called once, otherwise we would have to manage a pool
+        // of background thread which is overkill for our usage.
+        if (_done)
+        {
+            return nullptr; // programming error, create a second DNSLookup instance
+                            // if you need a second lookup.
+        }
+
+        //
+        // Good resource on thread forced termination
+        // https://www.bo-yang.net/2017/11/19/cpp-kill-detached-thread
+        //
+        auto ptr = shared_from_this();
+        std::weak_ptr<DNSLookup> self(ptr);
+
+        int port = _port;
+        std::string hostname(_hostname);
+
+        // We make the background thread doing the work a shared pointer
+        // instead of a member variable, because it can keep running when
+        // this object goes out of scope, in case of cancellation
+        auto t = std::make_shared<std::thread>(&DNSLookup::run, this, self, hostname, port);
+        t->detach();
+
+        while (!_done)
+        {
+            // Wait for 1 milliseconds, to see if the bg thread has terminated.
+            // We do not use a condition variable to wait, as destroying this one
+            // if the bg thread is alive can cause undefined behavior.
+            std::this_thread::sleep_for(std::chrono::milliseconds(_wait));
+
+            // Were we cancelled ?
+            if (isCancellationRequested())
+            {
+                errMsg = "cancellation requested";
+                return nullptr;
+            }
+        }
+
+        // Maybe a cancellation request got in before the bg terminated ?
+        if (isCancellationRequested())
+        {
+            errMsg = "cancellation requested";
+            return nullptr;
+        }
+
+        errMsg = getErrMsg();
+        return getRes();
+    }
+
+    struct addrinfo* resolveUnCancellable(
+        std::string& errMsg, const CancellationRequest& isCancellationRequested)
+    {
+        errMsg = "no error";
+
+        // Maybe a cancellation request got in before the background thread terminated ?
+        if (isCancellationRequested())
+        {
+            errMsg = "cancellation requested";
+            return nullptr;
+        }
+
+        return getAddrInfo(_hostname, _port, errMsg);
+    };
 
     static struct addrinfo* getAddrInfo(const std::string& hostname,
                                         int port,
@@ -95,13 +285,47 @@ private:
         return res;
     };
 
-    void run(std::weak_ptr<DNSLookup> self, std::string hostname, int port); // thread runner
+    void run(std::weak_ptr<DNSLookup> self,
+                        std::string hostname,
+                        int port) // thread runner
+    {
+        // We don't want to read or write into members variables of an object that could be
+        // gone, so we use temporary variables (res) or we pass in by copy everything that
+        // getAddrInfo needs to work.
+        std::string errMsg;
+        struct addrinfo* res = getAddrInfo(hostname, port, errMsg);
 
-    void setErrMsg(const std::string& errMsg);
-    const std::string& getErrMsg();
+        if (auto lock = self.lock())
+        {
+            // Copy result into the member variables
+            setRes(res);
+            setErrMsg(errMsg);
 
-    void setRes(struct addrinfo* addr);
-    struct addrinfo* getRes();
+            _done = true;
+        }
+    };
+
+    void setErrMsg(const std::string& errMsg)
+    {
+        std::lock_guard<std::mutex> lock(_errMsgMutex);
+        _errMsg = errMsg;
+    };
+    const std::string& getErrMsg()
+    {
+        std::lock_guard<std::mutex> lock(_errMsgMutex);
+        return _errMsg;
+    };
+
+    void setRes(struct addrinfo* addr)
+    {
+        std::lock_guard<std::mutex> lock(_resMutex);
+        _res = addr;
+    };
+    struct addrinfo* getRes()
+    {
+        std::lock_guard<std::mutex> lock(_resMutex);
+        return _res;
+    };
 
     std::string _hostname;
     int _port;
@@ -119,138 +343,41 @@ private:
 
 const int64_t DNSLookup::kDefaultWait = 1; // ms
 
-struct addrinfo* DNSLookup::resolve(std::string& errMsg,
-                                    const CancellationRequest& isCancellationRequested,
-                                    bool cancellable)
-{
-    return cancellable ? resolveCancellable(errMsg, isCancellationRequested)
-                        : resolveUnCancellable(errMsg, isCancellationRequested);
-}
-
-void DNSLookup::release(struct addrinfo* addr)
-{
-    freeaddrinfo(addr);
-}
-
-struct addrinfo* DNSLookup::resolveUnCancellable(
-    std::string& errMsg, const CancellationRequest& isCancellationRequested)
-{
-    errMsg = "no error";
-
-    // Maybe a cancellation request got in before the background thread terminated ?
-    if (isCancellationRequested())
-    {
-        errMsg = "cancellation requested";
-        return nullptr;
-    }
-
-    return getAddrInfo(_hostname, _port, errMsg);
-}
-
-struct addrinfo* DNSLookup::resolveCancellable(
-    std::string& errMsg, const CancellationRequest& isCancellationRequested)
-{
-    errMsg = "no error";
-
-    // Can only be called once, otherwise we would have to manage a pool
-    // of background thread which is overkill for our usage.
-    if (_done)
-    {
-        return nullptr; // programming error, create a second DNSLookup instance
-                        // if you need a second lookup.
-    }
-
-    //
-    // Good resource on thread forced termination
-    // https://www.bo-yang.net/2017/11/19/cpp-kill-detached-thread
-    //
-    auto ptr = shared_from_this();
-    std::weak_ptr<DNSLookup> self(ptr);
-
-    int port = _port;
-    std::string hostname(_hostname);
-
-    // We make the background thread doing the work a shared pointer
-    // instead of a member variable, because it can keep running when
-    // this object goes out of scope, in case of cancellation
-    auto t = std::make_shared<std::thread>(&DNSLookup::run, this, self, hostname, port);
-    t->detach();
-
-    while (!_done)
-    {
-        // Wait for 1 milliseconds, to see if the bg thread has terminated.
-        // We do not use a condition variable to wait, as destroying this one
-        // if the bg thread is alive can cause undefined behavior.
-        std::this_thread::sleep_for(std::chrono::milliseconds(_wait));
-
-        // Were we cancelled ?
-        if (isCancellationRequested())
-        {
-            errMsg = "cancellation requested";
-            return nullptr;
-        }
-    }
-
-    // Maybe a cancellation request got in before the bg terminated ?
-    if (isCancellationRequested())
-    {
-        errMsg = "cancellation requested";
-        return nullptr;
-    }
-
-    errMsg = getErrMsg();
-    return getRes();
-}
-
-void DNSLookup::run(std::weak_ptr<DNSLookup> self,
-                    std::string hostname,
-                    int port) // thread runner
-{
-    // We don't want to read or write into members variables of an object that could be
-    // gone, so we use temporary variables (res) or we pass in by copy everything that
-    // getAddrInfo needs to work.
-    std::string errMsg;
-    struct addrinfo* res = getAddrInfo(hostname, port, errMsg);
-
-    if (auto lock = self.lock())
-    {
-        // Copy result into the member variables
-        setRes(res);
-        setErrMsg(errMsg);
-
-        _done = true;
-    }
-}
-
-void DNSLookup::setErrMsg(const std::string& errMsg)
-{
-    std::lock_guard<std::mutex> lock(_errMsgMutex);
-    _errMsg = errMsg;
-}
-
-const std::string& DNSLookup::getErrMsg()
-{
-    std::lock_guard<std::mutex> lock(_errMsgMutex);
-    return _errMsg;
-}
-
-void DNSLookup::setRes(struct addrinfo* addr)
-{
-    std::lock_guard<std::mutex> lock(_resMutex);
-    _res = addr;
-}
-
-struct addrinfo* DNSLookup::getRes()
-{
-    std::lock_guard<std::mutex> lock(_resMutex);
-    return _res;
-}
-
 
 struct SocketTLSOptions {
 public:
     // check validity of the object
-    bool isValid() const;
+    bool isValid() const
+    {
+        if (!_validated)
+        {
+            if (!certFile.empty() && !std::ifstream(certFile))
+            {
+                _errMsg = "certFile not found: " + certFile;
+                return false;
+            }
+            if (!keyFile.empty() && !std::ifstream(keyFile))
+            {
+                _errMsg = "keyFile not found: " + keyFile;
+                return false;
+            }
+            if (!caFile.empty() && caFile != kTLSCAFileDisableVerify &&
+                caFile != kTLSCAFileUseSystemDefaults && !std::ifstream(caFile))
+            {
+                _errMsg = "caFile not found: " + caFile;
+                return false;
+            }
+
+            if (certFile.empty() != keyFile.empty())
+            {
+                _errMsg = "certFile and keyFile must be both present, or both absent";
+                return false;
+            }
+
+            _validated = true;
+        }
+        return true;
+    };
 
     // the certificate presented to peers
     std::string certFile;
@@ -269,26 +396,60 @@ public:
     // whether tls is enabled, used for server code
     bool tls = false;
 
-    bool hasCertAndKey() const;
+    bool hasCertAndKey() const {
+        return !certFile.empty() && !keyFile.empty();
+    };
 
-    bool isUsingSystemDefaults() const;
+    bool isUsingSystemDefaults() const {
+        return caFile == kTLSCAFileUseSystemDefaults;
+    };
 
-    bool isUsingInMemoryCAs() const;
+    bool isUsingInMemoryCAs() const {
+        return caFile.find(kTLSInMemoryMarker) != std::string::npos;
+    };
 
-    bool isPeerVerifyDisabled() const;
+    bool isPeerVerifyDisabled() const {
+        return caFile == kTLSCAFileDisableVerify;
+    };
 
-    bool isUsingDefaultCiphers() const;
+    bool isUsingDefaultCiphers() const {
+        return ciphers.empty() || ciphers == kTLSCiphersUseDefault;
+    }
 
-    const std::string& getErrorMsg() const;
+    const std::string& getErrorMsg() const {
+        return _errMsg;
+    };
 
-    std::string getDescription() const;
+    std::string getDescription() const {
+        std::stringstream ss;
+        ss << "TLS Options:" << std::endl;
+        ss << "  certFile = " << certFile << std::endl;
+        ss << "  keyFile  = " << keyFile << std::endl;
+        ss << "  caFile   = " << caFile << std::endl;
+        ss << "  ciphers  = " << ciphers << std::endl;
+        ss << "  tls      = " << tls << std::endl;
+        return ss.str();
+    }
 
 private:
+    const char* kTLSCAFileUseSystemDefaults = "SYSTEM";
+    const char* kTLSCAFileDisableVerify = "NONE";
+    const char* kTLSCiphersUseDefault = "DEFAULT";
+    const char* kTLSInMemoryMarker = "-----BEGIN CERTIFICATE-----";
+
     mutable std::string _errMsg;
     mutable bool _validated = false;
 };
 
-std::vector<std::unique_ptr<std::mutex>> openSSLMutexes;
+enum class PollResultType
+{
+    ReadyForRead = 0,
+    ReadyForWrite = 1,
+    Timeout = 2,
+    Error = 3,
+    SendRequest = 4,
+    CloseRequest = 5
+};
 
 class SocketOpenSSL {
 public:
@@ -297,23 +458,22 @@ public:
         , _ssl_connection(nullptr)
         , _ssl_context(nullptr)
         , _tlsOptions(tlsOptions) {
-        std::call_once(_openSSLInitFlag, &openSSLInitialize, this);
+        std::call_once(_openSSLInitFlag, &SocketOpenSSL::openSSLInitialize, this);
     }
 
     ~SocketOpenSSL() {
-        close();
+        ssl_close();
     };
 
-    bool aaccept(std::string& errMsg) {
+    bool accept(std::string& errMsg) {
         bool handshakeSuccessful = false;
         {
             std::lock_guard<std::mutex> lock(_mutex);
 
-            // if (!_openSSLInitializationSuccessful)
-            // {
-            //     errMsg = "OPENSSL_init_ssl failure";
-            //     return false;
-            // }
+            if (!_openSSLInitializationSuccessful) {
+                errMsg = "OPENSSL_init_ssl failure";
+                return false;
+            }
 
             if (_sockfd == -1) {
                 return false;
@@ -417,7 +577,7 @@ public:
         }
 
         if (!handshakeSuccessful) {
-            close();
+            ssl_close();
             return false;
         }
 
@@ -428,29 +588,24 @@ public:
         bool handshakeSuccessful = false;
         {
             std::lock_guard<std::mutex> lock(_mutex);
-            // if (!_openSSLInitializationSuccessful)
-            // {
-            //     errMsg = "OPENSSL_init_ssl failure";
-            //     return false;
-            // }
-
-            _sockfd = SocketConnect::connect(host, port, errMsg, isCancellationRequested);
-            if (_sockfd == -1) return false;
-
-            _ssl_context = openSSLCreateContext(errMsg);
-            if (_ssl_context == nullptr)
-            {
+            if (!_openSSLInitializationSuccessful) {
+                errMsg = "OPENSSL_init_ssl failure";
                 return false;
             }
 
-            if (!handleTLSOptions(errMsg))
-            {
+            _sockfd = socket_connect(host, port, errMsg, isCancellationRequested);
+            if (_sockfd == -1) return false;
+            _ssl_context = openSSLCreateContext(errMsg);
+            if (_ssl_context == nullptr) {
+                return false;
+            }
+
+            if (!handleTLSOptions(errMsg)) {
                 return false;
             }
 
             _ssl_connection = SSL_new(_ssl_context);
-            if (_ssl_connection == nullptr)
-            {
+            if (_ssl_connection == nullptr) {
                 errMsg = "OpenSSL failed to connect";
                 SSL_CTX_free(_ssl_context);
                 _ssl_context = nullptr;
@@ -470,20 +625,279 @@ public:
             handshakeSuccessful = openSSLClientHandshake(host, errMsg, isCancellationRequested);
         }
 
-        if (!handshakeSuccessful)
-        {
-            close();
+        if (!handshakeSuccessful) {
+            ssl_close();
             return false;
         }
 
         return true;
     };
-    virtual void close() final;
+    void ssl_close() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_ssl_connection != nullptr) {
+            SSL_free(_ssl_connection);
+            _ssl_connection = nullptr;
+        }
+        if (_ssl_context != nullptr) {
+            SSL_CTX_free(_ssl_context);
+            _ssl_context = nullptr;
+        }
 
-    virtual ssize_t send(char* buffer, size_t length) final;
-    virtual ssize_t recv(void* buffer, size_t length) final;
+        socket_close();
+    };
+
+    ssize_t send(char* buf, size_t nbyte){
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_ssl_connection == nullptr || _ssl_context == nullptr) {
+            return 0;
+        }
+
+        ERR_clear_error();
+        ssize_t write_result = SSL_write(_ssl_connection, buf, (int) nbyte);
+        int reason = SSL_get_error(_ssl_connection, (int) write_result);
+
+        if (reason == SSL_ERROR_NONE) {
+            return write_result;
+        } else if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE) {
+            errno = EWOULDBLOCK;
+            return -1;
+        } else {
+            return -1;
+        }
+    };
+    ssize_t ecv(void* buf, size_t nbyte) {
+        while (true)
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (_ssl_connection == nullptr || _ssl_context == nullptr) {
+                return 0;
+            }
+
+            ERR_clear_error();
+            ssize_t read_result = SSL_read(_ssl_connection, buf, (int) nbyte);
+            if (read_result > 0) {
+                return read_result;
+            }
+
+            int reason = SSL_get_error(_ssl_connection, (int) read_result);
+            if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE) {
+                errno = EWOULDBLOCK;
+            }
+            return -1;
+        }
+    };
 
 private:
+    void socket_close() {
+        std::lock_guard<std::mutex> lock(_socketMutex);
+        if (_sockfd == -1) return;
+        ::close(_sockfd);
+        _sockfd = -1;
+    }
+
+    void socket_configure(int sockfd)
+    {
+        // 1. disable Nagle's algorithm
+        int flag = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char*) &flag, sizeof(flag));
+
+        // 2. make socket non blocking
+        fcntl(sockfd, F_SETFL, O_NONBLOCK);
+    }
+
+    bool is_wait_needed() {
+        int err = errno;
+        if (err == EWOULDBLOCK || err == EAGAIN || err == EINPROGRESS) {
+            return true;
+        }
+
+        return false;
+    }
+
+    int connect_to_address(const struct addrinfo* address, std::string& errMsg, const CancellationRequest& isCancellationRequested) {
+        errMsg = "no error";
+        socket_t fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (fd < 0) {
+            errMsg = "Cannot create a socket";
+            return -1;
+        }
+
+        // set the socket to non blocking mode
+        socket_configure(fd);
+        int res = ::connect(fd, address->ai_addr, address->ai_addrlen);
+        if (res == -1 && !is_wait_needed())
+        {
+            errMsg = strerror(errno);
+            ::close(fd);
+            return -1;
+        }
+
+        for (;;) {
+            if (isCancellationRequested && isCancellationRequested()) {
+                ::close(fd);
+                errMsg = "Cancelled";
+                return -1;
+            }
+
+            int timeoutMs = 10;
+            bool readyToRead = false;
+            SelectInterruptPtr selectInterrupt = createSelectInterrupt();
+            PollResultType pollResult = socket_poll(readyToRead, timeoutMs, fd, selectInterrupt);
+
+            if (pollResult == PollResultType::Timeout)
+            {
+                continue;
+            } else if (pollResult == PollResultType::Error) {
+                ::close(fd);
+                errMsg = std::string("Connect error: ") + strerror(errno);
+                return -1;
+            } else if (pollResult == PollResultType::ReadyForWrite) {
+                return fd;
+            } else {
+                ::close(fd);
+                errMsg = std::string("Connect error: ") + strerror(errno);
+                return -1;
+            }
+        }
+    }
+
+    int poll(struct pollfd* fds, nfds_t nfds, int timeout, void** event) {
+        if (event && *event) *event = nullptr;
+
+        //
+        // It was reported that on Android poll can fail and return -1 with
+        // errno == EINTR, which should be a temp error and should typically
+        // be handled by retrying in a loop.
+        // Maybe we need to put all syscall / C functions in
+        // a new IXSysCalls.cpp and wrap them all.
+        //
+        // The style from libuv is as such.
+        //
+        int ret = -1;
+        do
+        {
+            ret = ::poll(fds, nfds, timeout);
+        } while (ret == -1 && errno == EINTR);
+
+        return ret;
+    }
+
+    PollResultType socket_poll(bool readyToRead, int timeoutMs, int sockfd, const SelectInterruptPtr& selectInterrupt) {
+        PollResultType pollResult = PollResultType::ReadyForRead;
+
+        //
+        // We used to use ::select to poll but on Android 9 we get large fds out of
+        // ::connect which crash in FD_SET as they are larger than FD_SETSIZE. Switching
+        // to ::poll does fix that.
+        //
+        // However poll isn't as portable as select and has bugs on Windows, so we
+        // have a shim to fallback to select on those platforms. See
+        // https://github.com/mpv-player/mpv/pull/5203/files for such a select wrapper.
+        //
+        nfds_t nfds = 1;
+        struct pollfd fds[2];
+        memset(fds, 0, sizeof(fds));
+
+        fds[0].fd = sockfd;
+        fds[0].events = (readyToRead) ? POLLIN : POLLOUT;
+
+        // this is ignored by poll, but our select based poll wrapper on Windows needs it
+        fds[0].events |= POLLERR;
+
+        // File descriptor used to interrupt select when needed
+        int interruptFd = -1;
+        void* interruptEvent = nullptr;
+        if (selectInterrupt)
+        {
+            interruptFd = selectInterrupt->getFd();
+            interruptEvent = selectInterrupt->getEvent();
+
+            if (interruptFd != -1)
+            {
+                nfds = 2;
+                fds[1].fd = interruptFd;
+                fds[1].events = POLLIN;
+            }
+            else if (interruptEvent == nullptr)
+            {
+                // Emulation mode: SelectInterrupt neither supports file descriptors nor events
+
+                // Check the selectInterrupt for requests before doing the poll().
+                if (readSelectInterruptRequest(selectInterrupt, &pollResult))
+                {
+                    return pollResult;
+                }
+            }
+        }
+
+        void* event = interruptEvent; // ix::poll will set event to nullptr if it wasn't signaled
+        int ret = poll(fds, nfds, timeoutMs, &event);
+
+        if (ret < 0)
+        {
+            pollResult = PollResultType::Error;
+        }
+        else if (ret == 0)
+        {
+            pollResult = PollResultType::Timeout;
+            if (selectInterrupt && interruptFd == -1 && interruptEvent == nullptr)
+            {
+                // Emulation mode: SelectInterrupt neither supports fd nor events
+
+                // Check the selectInterrupt for requests
+                readSelectInterruptRequest(selectInterrupt, &pollResult);
+            }
+        }
+        else if ((interruptFd != -1 && fds[1].revents & POLLIN) || (interruptEvent != nullptr && event != nullptr))
+        {
+            // The InterruptEvent was signaled
+            readSelectInterruptRequest(selectInterrupt, &pollResult);
+        }
+        else if (sockfd != -1 && readyToRead && fds[0].revents & POLLIN)
+        {
+            pollResult = PollResultType::ReadyForRead;
+        }
+        else if (sockfd != -1 && !readyToRead && fds[0].revents & POLLOUT)
+        {
+            pollResult = PollResultType::ReadyForWrite;
+            int optval = -1;
+            socklen_t optlen = sizeof(optval);
+
+            // getsockopt() puts the errno value for connect into optval so 0
+            // means no-error.
+            if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen) == -1 || optval != 0)
+            {
+                pollResult = PollResultType::Error;
+
+                // set errno to optval so that external callers can have an
+                // appropriate error description when calling strerror
+                errno = optval;
+            }
+        }
+        else if (sockfd != -1 && (fds[0].revents & POLLERR || fds[0].revents & POLLHUP ||
+                                fds[0].revents & POLLNVAL))
+        {
+            pollResult = PollResultType::Error;
+        }
+
+        return pollResult;
+    }
+
+
+    bool readSelectInterruptRequest(const SelectInterruptPtr& selectInterrupt, PollResultType* pollResult){
+        uint64_t value = selectInterrupt->read();
+
+        if (value == SelectInterrupt::kSendRequest) {
+            *pollResult = PollResultType::SendRequest;
+            return true;
+        } else if (value == SelectInterrupt::kCloseRequest) {
+            *pollResult = PollResultType::CloseRequest;
+            return true;
+        }
+
+        return false;
+    }
+
     int socket_connect(const std::string& hostname, int port, std::string& errMsg, const CancellationRequest& isCancellationRequested) {
         //
         // First do DNS resolution
@@ -502,7 +916,7 @@ private:
             //
             // Second try to connect to the remote host
             //
-            sockfd = connectToAddress(address, errMsg, isCancellationRequested);
+            sockfd = connect_to_address(address, errMsg, isCancellationRequested);
             if (sockfd != -1)
             {
                 break;
@@ -760,167 +1174,23 @@ private:
         }
     }
 
-    // Required for OpenSSL < 1.1
-    static void openSSLLockingCallback(int mode, int type, const char* /*file*/, int /*line*/){
-        if (mode & CRYPTO_LOCK) {
-            openSSLMutexes[type]->lock();
-        } else {
-            openSSLMutexes[type]->unlock();
-        }
-    }
-
+    int _sockfd;
     SSL* _ssl_connection;
     SSL_CTX* _ssl_context;
     const SSL_METHOD* _ssl_method;
     SocketTLSOptions _tlsOptions;
-    int _sockfd;
 
     mutable std::mutex _mutex; // OpenSSL routines are not thread-safe
+    std::mutex _socketMutex;
 
-    std::unique_ptr<SelectInterrupt> _selectInterrupt;
+    SelectInterruptPtr _selectInterrupt;
 
     static std::once_flag _openSSLInitFlag;
     static std::atomic<bool> _openSSLInitializationSuccessful;
 };
 
 std::once_flag SocketOpenSSL::_openSSLInitFlag;
-std::atomic<bool> _openSSLInitializationSuccessful;
-
-
-bool SocketOpenSSL::connect(const std::string& host,
-                            int port,
-                            std::string& errMsg,
-                            const CancellationRequest& isCancellationRequested)
-{
-    bool handshakeSuccessful = false;
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-
-        // if (!_openSSLInitializationSuccessful)
-        // {
-        //     errMsg = "OPENSSL_init_ssl failure";
-        //     return false;
-        // }
-
-        _sockfd = SocketConnect::connect(host, port, errMsg, isCancellationRequested);
-        if (_sockfd == -1) return false;
-
-        _ssl_context = openSSLCreateContext(errMsg);
-        if (_ssl_context == nullptr)
-        {
-            return false;
-        }
-
-        if (!handleTLSOptions(errMsg))
-        {
-            return false;
-        }
-
-        _ssl_connection = SSL_new(_ssl_context);
-        if (_ssl_connection == nullptr)
-        {
-            errMsg = "OpenSSL failed to connect";
-            SSL_CTX_free(_ssl_context);
-            _ssl_context = nullptr;
-            return false;
-        }
-        SSL_set_fd(_ssl_connection, _sockfd);
-
-        // SNI support
-        SSL_set_tlsext_host_name(_ssl_connection, host.c_str());
-
-        // Support for server name verification
-        // (The docs say that this should work from 1.0.2, and is the default from
-        // 1.1.0, but it does not. To be on the safe side, the manual test
-        // below is enabled for all versions prior to 1.1.0.)
-        X509_VERIFY_PARAM* param = SSL_get0_param(_ssl_connection);
-        X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
-        handshakeSuccessful = openSSLClientHandshake(host, errMsg, isCancellationRequested);
-    }
-
-    if (!handshakeSuccessful)
-    {
-        close();
-        return false;
-    }
-
-    return true;
-}
-
-void SocketOpenSSL::close()
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-
-    if (_ssl_connection != nullptr)
-    {
-        SSL_free(_ssl_connection);
-        _ssl_connection = nullptr;
-    }
-    if (_ssl_context != nullptr)
-    {
-        SSL_CTX_free(_ssl_context);
-        _ssl_context = nullptr;
-    }
-
-    Socket::close();
-}
-
-ssize_t SocketOpenSSL::send(char* buf, size_t nbyte)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-
-    if (_ssl_connection == nullptr || _ssl_context == nullptr)
-    {
-        return 0;
-    }
-
-    ERR_clear_error();
-    ssize_t write_result = SSL_write(_ssl_connection, buf, (int) nbyte);
-    int reason = SSL_get_error(_ssl_connection, (int) write_result);
-
-    if (reason == SSL_ERROR_NONE)
-    {
-        return write_result;
-    }
-    else if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE)
-    {
-        errno = EWOULDBLOCK;
-        return -1;
-    }
-    else
-    {
-        return -1;
-    }
-}
-
-ssize_t SocketOpenSSL::recv(void* buf, size_t nbyte)
-{
-    while (true)
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-
-        if (_ssl_connection == nullptr || _ssl_context == nullptr)
-        {
-            return 0;
-        }
-
-        ERR_clear_error();
-        ssize_t read_result = SSL_read(_ssl_connection, buf, (int) nbyte);
-
-        if (read_result > 0)
-        {
-            return read_result;
-        }
-
-        int reason = SSL_get_error(_ssl_connection, (int) read_result);
-
-        if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE)
-        {
-            errno = EWOULDBLOCK;
-        }
-        return -1;
-    }
-}
+std::atomic<bool> SocketOpenSSL::_openSSLInitializationSuccessful(false);
 
 class websocket_client final {
 public:
@@ -1158,4 +1428,10 @@ int main() {
     std::string protocol, host;
     int port;
     c.parse_url(protocol, host, port, url);
+
+    DNSLookup dns_lookup(host, port);
+    std::string err_msg;
+    CancellationRequest cancellation_request;
+    addrinfo* address_info = dns_lookup.resolve(err_msg, cancellation_request);
+    std::cout << "address_info: " << address_info << std::endl;
 }
