@@ -27,6 +27,15 @@
             "cwd": "${workspaceFolder}",
             "args": [],
             "stopAtEntry": false,
+        },
+        {
+            "name": "Launch Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/test",
+            "cwd": "${workspaceFolder}",
+            "args": [],
+            "stopAtEntry": false,
         }
     ]
 }

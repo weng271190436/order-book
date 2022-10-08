@@ -3,59 +3,42 @@
 #include <ixwebsocket/IXUserAgent.h>
 #include <iostream>
 
-int main()
-{
-    // Our websocket object
+int main() {
     ix::WebSocket webSocket;
-
-    // Connect to a server with encryption
-    // See https://machinezone.github.io/IXWebSocket/usage/#tls-support-and-configuration
-    std::string url("wss://echo.websocket.org");
+    std::string url("wss://ws-feed.exchange.coinbase.com:443");
     webSocket.setUrl(url);
+    webSocket.setPingInterval(45);
 
     std::cout << ix::userAgent() << std::endl;
     std::cout << "Connecting to " << url << "..." << std::endl;
 
     // Setup a callback to be fired (in a background thread, watch out for race conditions !)
     // when a message or an event (open, close, error) is received
-    webSocket.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg)
-        {
-            if (msg->type == ix::WebSocketMessageType::Message)
+    webSocket.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg) {
+            if (msg->type == ix::WebSocketMessageType::Open)
             {
-                std::cout << "received message: " << msg->str << std::endl;
-                std::cout << "> " << std::flush;
+                std::cout << "Connection opened" << std::endl;
             }
-            else if (msg->type == ix::WebSocketMessageType::Open)
+            else if (msg->type == ix::WebSocketMessageType::Close)
             {
-                std::cout << "Connection established" << std::endl;
-                std::cout << "> " << std::flush;
+                std::cout << "Connection closed" << std::endl;
             }
             else if (msg->type == ix::WebSocketMessageType::Error)
             {
-                // Maybe SSL is not configured properly
-                std::cout << "Connection error: " << msg->errorInfo.reason << std::endl;
-                std::cout << "> " << std::flush;
+                std::cout << "Error: " << msg->errorInfo.reason << std::endl;
+            }
+            else if (msg->type == ix::WebSocketMessageType::Message)
+            {
+                std::cout << "Message received: " << msg->str << std::endl;
             }
         }
     );
 
-    // Now that our callback is setup, we can start our background thread and receive messages
     webSocket.start();
-
-    // Send a message to the server (default to TEXT mode)
-    webSocket.send("hello world");
-
-    // Display a prompt
-    std::cout << "> " << std::flush;
-
-    std::string text;
-    // Read text from the console and send messages in text mode.
-    // Exit with Ctrl-D on Unix or Ctrl-Z on Windows.
-    while (std::getline(std::cin, text))
-    {
-        webSocket.send(text);
-        std::cout << "> " << std::flush;
+    while (true) {
+        sleep(1);
+        webSocket.send("hello world");
     }
-
+    webSocket.stop();
     return 0;
 }
