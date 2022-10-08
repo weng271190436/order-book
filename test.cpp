@@ -3,10 +3,926 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <atomic>
+#include <cstring>
+
+#include <openssl/bio.h>
+#include <openssl/conf.h>
+#include <openssl/err.h>
+#include <openssl/hmac.h>
+#include <openssl/ssl.h>
+#include <fnmatch.h>
+#include <netdb.h>
 
 typedef std::unordered_map<std::string, std::string> headers;
 
-class websocket_client {
+const std::string kDefaultCiphers =
+    "ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA-AES128-SHA "
+    "ECDHE-ECDSA-AES256-SHA ECDHE-ECDSA-AES128-SHA256 ECDHE-ECDSA-AES256-SHA384 "
+    "ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-AES256-GCM-SHA384 ECDHE-RSA-AES128-SHA "
+    "ECDHE-RSA-AES256-SHA ECDHE-RSA-AES128-SHA256 ECDHE-RSA-AES256-SHA384 "
+    "DHE-RSA-AES128-GCM-SHA256 DHE-RSA-AES256-GCM-SHA384 DHE-RSA-AES128-SHA "
+    "DHE-RSA-AES256-SHA DHE-RSA-AES128-SHA256 DHE-RSA-AES256-SHA256 AES128-SHA";
+
+using CancellationRequest = std::function<bool()>;
+
+class SelectInterrupt
+{
+public:
+    SelectInterrupt() {};
+    ~SelectInterrupt() {};
+    
+    bool init(std::string& errorMsg) { return true; };
+    bool notify(uint64_t value) { return true; };
+    bool clear() { return true; };
+    uint64_t read() { return 0; };
+    int getFd() const { return -1; };
+    void* getEvent() const { return nullptr; };
+
+    // Used as special codes for pipe communication
+    static const uint64_t kSendRequest;
+    static const uint64_t kCloseRequest;
+};
+
+const uint64_t SelectInterrupt::kSendRequest = 1;
+const uint64_t SelectInterrupt::kCloseRequest = 2;
+
+class DNSLookup : public std::enable_shared_from_this<DNSLookup> {
+public:
+    DNSLookup(const std::string& hostname, int port, int64_t wait)
+        : _hostname(hostname)
+        , _port(port)
+        , _wait(wait)
+        , _res(nullptr)
+        , _done(false)
+    {
+        ;
+    };
+    ~DNSLookup() = default;
+
+    struct addrinfo* resolve(std::string& errMsg,
+                                const CancellationRequest& isCancellationRequested,
+                                bool cancellable = true);
+
+    void release(struct addrinfo* addr);
+
+private:
+    struct addrinfo* resolveCancellable(std::string& errMsg,
+                                        const CancellationRequest& isCancellationRequested);
+    struct addrinfo* resolveUnCancellable(std::string& errMsg,
+                                            const CancellationRequest& isCancellationRequested);
+
+    static struct addrinfo* getAddrInfo(const std::string& hostname,
+                                        int port,
+                                        std::string& errMsg) {
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+
+        std::string sport = std::to_string(port);
+
+        struct addrinfo* res;
+        int getaddrinfo_result = getaddrinfo(hostname.c_str(), sport.c_str(), &hints, &res);
+        if (getaddrinfo_result)
+        {
+            errMsg = gai_strerror(getaddrinfo_result);
+            res = nullptr;
+        }
+        return res;
+    };
+
+    void run(std::weak_ptr<DNSLookup> self, std::string hostname, int port); // thread runner
+
+    void setErrMsg(const std::string& errMsg);
+    const std::string& getErrMsg();
+
+    void setRes(struct addrinfo* addr);
+    struct addrinfo* getRes();
+
+    std::string _hostname;
+    int _port;
+    int64_t _wait;
+    const static int64_t kDefaultWait;
+
+    struct addrinfo* _res;
+    std::mutex _resMutex;
+
+    std::string _errMsg;
+    std::mutex _errMsgMutex;
+
+    std::atomic<bool> _done;
+};
+
+const int64_t DNSLookup::kDefaultWait = 1; // ms
+
+struct addrinfo* DNSLookup::resolve(std::string& errMsg,
+                                    const CancellationRequest& isCancellationRequested,
+                                    bool cancellable)
+{
+    return cancellable ? resolveCancellable(errMsg, isCancellationRequested)
+                        : resolveUnCancellable(errMsg, isCancellationRequested);
+}
+
+void DNSLookup::release(struct addrinfo* addr)
+{
+    freeaddrinfo(addr);
+}
+
+struct addrinfo* DNSLookup::resolveUnCancellable(
+    std::string& errMsg, const CancellationRequest& isCancellationRequested)
+{
+    errMsg = "no error";
+
+    // Maybe a cancellation request got in before the background thread terminated ?
+    if (isCancellationRequested())
+    {
+        errMsg = "cancellation requested";
+        return nullptr;
+    }
+
+    return getAddrInfo(_hostname, _port, errMsg);
+}
+
+struct addrinfo* DNSLookup::resolveCancellable(
+    std::string& errMsg, const CancellationRequest& isCancellationRequested)
+{
+    errMsg = "no error";
+
+    // Can only be called once, otherwise we would have to manage a pool
+    // of background thread which is overkill for our usage.
+    if (_done)
+    {
+        return nullptr; // programming error, create a second DNSLookup instance
+                        // if you need a second lookup.
+    }
+
+    //
+    // Good resource on thread forced termination
+    // https://www.bo-yang.net/2017/11/19/cpp-kill-detached-thread
+    //
+    auto ptr = shared_from_this();
+    std::weak_ptr<DNSLookup> self(ptr);
+
+    int port = _port;
+    std::string hostname(_hostname);
+
+    // We make the background thread doing the work a shared pointer
+    // instead of a member variable, because it can keep running when
+    // this object goes out of scope, in case of cancellation
+    auto t = std::make_shared<std::thread>(&DNSLookup::run, this, self, hostname, port);
+    t->detach();
+
+    while (!_done)
+    {
+        // Wait for 1 milliseconds, to see if the bg thread has terminated.
+        // We do not use a condition variable to wait, as destroying this one
+        // if the bg thread is alive can cause undefined behavior.
+        std::this_thread::sleep_for(std::chrono::milliseconds(_wait));
+
+        // Were we cancelled ?
+        if (isCancellationRequested())
+        {
+            errMsg = "cancellation requested";
+            return nullptr;
+        }
+    }
+
+    // Maybe a cancellation request got in before the bg terminated ?
+    if (isCancellationRequested())
+    {
+        errMsg = "cancellation requested";
+        return nullptr;
+    }
+
+    errMsg = getErrMsg();
+    return getRes();
+}
+
+void DNSLookup::run(std::weak_ptr<DNSLookup> self,
+                    std::string hostname,
+                    int port) // thread runner
+{
+    // We don't want to read or write into members variables of an object that could be
+    // gone, so we use temporary variables (res) or we pass in by copy everything that
+    // getAddrInfo needs to work.
+    std::string errMsg;
+    struct addrinfo* res = getAddrInfo(hostname, port, errMsg);
+
+    if (auto lock = self.lock())
+    {
+        // Copy result into the member variables
+        setRes(res);
+        setErrMsg(errMsg);
+
+        _done = true;
+    }
+}
+
+void DNSLookup::setErrMsg(const std::string& errMsg)
+{
+    std::lock_guard<std::mutex> lock(_errMsgMutex);
+    _errMsg = errMsg;
+}
+
+const std::string& DNSLookup::getErrMsg()
+{
+    std::lock_guard<std::mutex> lock(_errMsgMutex);
+    return _errMsg;
+}
+
+void DNSLookup::setRes(struct addrinfo* addr)
+{
+    std::lock_guard<std::mutex> lock(_resMutex);
+    _res = addr;
+}
+
+struct addrinfo* DNSLookup::getRes()
+{
+    std::lock_guard<std::mutex> lock(_resMutex);
+    return _res;
+}
+
+
+struct SocketTLSOptions {
+public:
+    // check validity of the object
+    bool isValid() const;
+
+    // the certificate presented to peers
+    std::string certFile;
+
+    // the key used for signing/encryption
+    std::string keyFile;
+
+    // the ca certificate (or certificate bundle) file containing
+    // certificates to be trusted by peers; use 'SYSTEM' to
+    // leverage the system defaults, use 'NONE' to disable peer verification
+    std::string caFile = "SYSTEM";
+
+    // list of ciphers (rsa, etc...)
+    std::string ciphers = "DEFAULT";
+
+    // whether tls is enabled, used for server code
+    bool tls = false;
+
+    bool hasCertAndKey() const;
+
+    bool isUsingSystemDefaults() const;
+
+    bool isUsingInMemoryCAs() const;
+
+    bool isPeerVerifyDisabled() const;
+
+    bool isUsingDefaultCiphers() const;
+
+    const std::string& getErrorMsg() const;
+
+    std::string getDescription() const;
+
+private:
+    mutable std::string _errMsg;
+    mutable bool _validated = false;
+};
+
+std::vector<std::unique_ptr<std::mutex>> openSSLMutexes;
+
+class SocketOpenSSL {
+public:
+    SocketOpenSSL(const SocketTLSOptions& tlsOptions, int fd = -1)
+        : _sockfd(fd)
+        , _ssl_connection(nullptr)
+        , _ssl_context(nullptr)
+        , _tlsOptions(tlsOptions) {
+        std::call_once(_openSSLInitFlag, &openSSLInitialize, this);
+    }
+
+    ~SocketOpenSSL() {
+        close();
+    };
+
+    bool aaccept(std::string& errMsg) {
+        bool handshakeSuccessful = false;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+
+            // if (!_openSSLInitializationSuccessful)
+            // {
+            //     errMsg = "OPENSSL_init_ssl failure";
+            //     return false;
+            // }
+
+            if (_sockfd == -1) {
+                return false;
+            }
+
+            {
+                const SSL_METHOD* method = SSLv23_server_method();
+                if (method == nullptr)
+                {
+                    errMsg = "SSLv23_server_method failure";
+                    _ssl_context = nullptr;
+                } else {
+                    _ssl_method = method;
+                    _ssl_context = SSL_CTX_new(_ssl_method);
+                    if (_ssl_context) {
+                        SSL_CTX_set_mode(_ssl_context, SSL_MODE_ENABLE_PARTIAL_WRITE);
+                        SSL_CTX_set_mode(_ssl_context, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+                        SSL_CTX_set_options(_ssl_context,
+                                            SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+                    }
+                }
+            }
+
+            if (_ssl_context == nullptr) {
+                return false;
+            }
+
+            ERR_clear_error();
+            if (_tlsOptions.hasCertAndKey()) {
+                if (SSL_CTX_use_certificate_chain_file(_ssl_context, _tlsOptions.certFile.c_str()) != 1) {
+                    auto sslErr = ERR_get_error();
+                    errMsg = "OpenSSL failed - SSL_CTX_use_certificate_chain_file(\"" +
+                                _tlsOptions.certFile + "\") failed: ";
+                    errMsg += ERR_error_string(sslErr, nullptr);
+                } else if (SSL_CTX_use_PrivateKey_file(_ssl_context, _tlsOptions.keyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+                    auto sslErr = ERR_get_error();
+                    errMsg = "OpenSSL failed - SSL_CTX_use_PrivateKey_file(\"" +
+                                _tlsOptions.keyFile + "\") failed: ";
+                    errMsg += ERR_error_string(sslErr, nullptr);
+                }
+            }
+
+
+            ERR_clear_error();
+            if (!_tlsOptions.isPeerVerifyDisabled()) {
+                if (_tlsOptions.isUsingSystemDefaults()) {
+                    if (SSL_CTX_set_default_verify_paths(_ssl_context) == 0) {
+                        auto sslErr = ERR_get_error();
+                        errMsg = "OpenSSL failed - SSL_CTX_default_verify_paths loading failed: ";
+                        errMsg += ERR_error_string(sslErr, nullptr);
+                    }
+                } else {
+                    if (_tlsOptions.isUsingInMemoryCAs()) {
+                        // Load from memory
+                        openSSLAddCARootsFromString(_tlsOptions.caFile);
+                    } else {
+                        const char* root_ca_file = _tlsOptions.caFile.c_str();
+                        STACK_OF(X509_NAME) * rootCAs;
+                        rootCAs = SSL_load_client_CA_file(root_ca_file);
+                        if (rootCAs == NULL) {
+                            auto sslErr = ERR_get_error();
+                            errMsg = "OpenSSL failed - SSL_load_client_CA_file('" +
+                                        _tlsOptions.caFile + "') failed: ";
+                            errMsg += ERR_error_string(sslErr, nullptr);
+                        } else {
+                            SSL_CTX_set_client_CA_list(_ssl_context, rootCAs);
+                            if (SSL_CTX_load_verify_locations(_ssl_context, root_ca_file, nullptr) != 1) {
+                                auto sslErr = ERR_get_error();
+                                errMsg = "OpenSSL failed - SSL_CTX_load_verify_locations(\"" +
+                                            _tlsOptions.caFile + "\") failed: ";
+                                errMsg += ERR_error_string(sslErr, nullptr);
+                            }
+                        }
+                    }
+                }
+
+                SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+                SSL_CTX_set_verify_depth(_ssl_context, 4);
+            } else {
+                SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_NONE, nullptr);
+            }
+            if (_tlsOptions.isUsingDefaultCiphers()) {
+                if (SSL_CTX_set_cipher_list(_ssl_context, kDefaultCiphers.c_str()) != 1) {
+                    return false;
+                }
+            } else if (SSL_CTX_set_cipher_list(_ssl_context, _tlsOptions.ciphers.c_str()) != 1) {
+                return false;
+            }
+
+            _ssl_connection = SSL_new(_ssl_context);
+            if (_ssl_connection == nullptr) {
+                errMsg = "OpenSSL failed to connect";
+                SSL_CTX_free(_ssl_context);
+                _ssl_context = nullptr;
+                return false;
+            }
+
+            SSL_set_ecdh_auto(_ssl_connection, 1);
+            SSL_set_fd(_ssl_connection, _sockfd);
+            handshakeSuccessful = openSSLServerHandshake(errMsg);
+        }
+
+        if (!handshakeSuccessful) {
+            close();
+            return false;
+        }
+
+        return true;
+    }
+
+    bool connect(const std::string& host, int port, std::string& errMsg, const CancellationRequest& isCancellationRequested) {
+        bool handshakeSuccessful = false;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            // if (!_openSSLInitializationSuccessful)
+            // {
+            //     errMsg = "OPENSSL_init_ssl failure";
+            //     return false;
+            // }
+
+            _sockfd = SocketConnect::connect(host, port, errMsg, isCancellationRequested);
+            if (_sockfd == -1) return false;
+
+            _ssl_context = openSSLCreateContext(errMsg);
+            if (_ssl_context == nullptr)
+            {
+                return false;
+            }
+
+            if (!handleTLSOptions(errMsg))
+            {
+                return false;
+            }
+
+            _ssl_connection = SSL_new(_ssl_context);
+            if (_ssl_connection == nullptr)
+            {
+                errMsg = "OpenSSL failed to connect";
+                SSL_CTX_free(_ssl_context);
+                _ssl_context = nullptr;
+                return false;
+            }
+            SSL_set_fd(_ssl_connection, _sockfd);
+
+            // SNI support
+            SSL_set_tlsext_host_name(_ssl_connection, host.c_str());
+
+            // Support for server name verification
+            // (The docs say that this should work from 1.0.2, and is the default from
+            // 1.1.0, but it does not. To be on the safe side, the manual test
+            // below is enabled for all versions prior to 1.1.0.)
+            X509_VERIFY_PARAM* param = SSL_get0_param(_ssl_connection);
+            X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
+            handshakeSuccessful = openSSLClientHandshake(host, errMsg, isCancellationRequested);
+        }
+
+        if (!handshakeSuccessful)
+        {
+            close();
+            return false;
+        }
+
+        return true;
+    };
+    virtual void close() final;
+
+    virtual ssize_t send(char* buffer, size_t length) final;
+    virtual ssize_t recv(void* buffer, size_t length) final;
+
+private:
+    int socket_connect(const std::string& hostname, int port, std::string& errMsg, const CancellationRequest& isCancellationRequested) {
+        //
+        // First do DNS resolution
+        //
+        auto dnsLookup = std::make_shared<DNSLookup>(hostname, port);
+        struct addrinfo* res = dnsLookup->resolve(errMsg, isCancellationRequested);
+        if (res == nullptr) {
+            return -1;
+        }
+
+        int sockfd = -1;
+
+        // iterate through the records to find a working peer
+        struct addrinfo* address;
+        for (address = res; address != nullptr; address = address->ai_next) {
+            //
+            // Second try to connect to the remote host
+            //
+            sockfd = connectToAddress(address, errMsg, isCancellationRequested);
+            if (sockfd != -1)
+            {
+                break;
+            }
+        }
+
+        freeaddrinfo(res);
+        return sockfd;
+    }
+
+    void openSSLInitialize() {
+        if (!OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, nullptr)) return;
+
+        (void) OpenSSL_add_ssl_algorithms();
+        (void) SSL_load_error_strings();
+    };
+    std::string getSSLError(int ret) {
+        unsigned long e;
+        int err = SSL_get_error(_ssl_connection, ret);
+        if (err == SSL_ERROR_WANT_CONNECT || err == SSL_ERROR_WANT_ACCEPT) {
+            return "OpenSSL failed - connection failure";
+        } else if (err == SSL_ERROR_WANT_X509_LOOKUP) {
+            return "OpenSSL failed - x509 error";
+        } else if (err == SSL_ERROR_SYSCALL) {
+            e = ERR_get_error();
+            if (e > 0) {
+                std::string errMsg("OpenSSL failed - ");
+                errMsg += ERR_error_string(e, nullptr);
+                return errMsg;
+            } else if (e == 0 && ret == 0) {
+                return "OpenSSL failed - received early EOF";
+            } else {
+                return "OpenSSL failed - underlying BIO reported an I/O error";
+            }
+        } else if (err == SSL_ERROR_SSL) {
+            e = ERR_get_error();
+            std::string errMsg("OpenSSL failed - ");
+            errMsg += ERR_error_string(e, nullptr);
+            return errMsg;
+        } else if (err == SSL_ERROR_NONE) {
+            return "OpenSSL failed - err none";
+        } else if (err == SSL_ERROR_ZERO_RETURN) {
+            return "OpenSSL failed - err zero return";
+        } else {
+            return "OpenSSL failed - unknown error";
+        }
+    };
+    SSL_CTX* openSSLCreateContext(std::string& errMsg) {
+        const SSL_METHOD* method = SSLv23_client_method();
+        if (method == nullptr) {
+            errMsg = "SSLv23_client_method failure";
+            return nullptr;
+        }
+        _ssl_method = method;
+
+        SSL_CTX* ctx = SSL_CTX_new(_ssl_method);
+        if (ctx) {
+            SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+            int options = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_CIPHER_SERVER_PREFERENCE;
+            options |= SSL_OP_NO_TLSv1_3;
+            SSL_CTX_set_options(ctx, options);
+        }
+        return ctx;
+    }
+
+    bool openSSLAddCARootsFromString(const std::string roots) {
+        // Create certificate store
+        X509_STORE* certificate_store = SSL_CTX_get_cert_store(_ssl_context);
+        if (certificate_store == nullptr) return false;
+
+        // Configure to allow intermediate certs
+        X509_STORE_set_flags(certificate_store, X509_V_FLAG_TRUSTED_FIRST | X509_V_FLAG_PARTIAL_CHAIN);
+
+        // Create a new buffer and populate it with the roots
+        BIO* buffer = BIO_new_mem_buf((void*) roots.c_str(), static_cast<int>(roots.length()));
+        if (buffer == nullptr) return false;
+
+        // Read each root in the buffer and add to the certificate store
+        bool success = true;
+        size_t number_of_roots = 0;
+
+        while (true) {
+            // Read the next root in the buffer
+            X509* root = PEM_read_bio_X509_AUX(buffer, nullptr, nullptr, (void*) "");
+            if (root == nullptr) {
+                // No more certs left in the buffer, we're done.
+                ERR_clear_error();
+                break;
+            }
+
+            // Try adding the root to the certificate store
+            ERR_clear_error();
+            if (!X509_STORE_add_cert(certificate_store, root)) {
+                // Failed to add. If the error is unrelated to the x509 lib or the cert already
+                // exists, we're safe to continue.
+                unsigned long error = ERR_get_error();
+                if (ERR_GET_LIB(error) != ERR_LIB_X509 || ERR_GET_REASON(error) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+                    // Failed. Clean up and bail.
+                    success = false;
+                    X509_free(root);
+                    break;
+                }
+            }
+
+            // Clean up and loop
+            X509_free(root);
+            number_of_roots++;
+        }
+
+        // Clean up buffer
+        BIO_free(buffer);
+
+        // Make sure we loaded at least one certificate.
+        if (number_of_roots == 0) success = false;
+
+        return success;
+    };
+    bool openSSLClientHandshake(const std::string& hostname, std::string& errMsg, const CancellationRequest& cancellation_requested) {
+        while (true) {
+            if (_ssl_connection == nullptr || _ssl_context == nullptr) {
+                return false;
+            }
+
+            if (cancellation_requested()) {
+                errMsg = "cancellation requested";
+                return false;
+            }
+
+            ERR_clear_error();
+            int connect_result = SSL_connect(_ssl_connection);
+            if (connect_result == 1) {
+                return openSSLCheckServerCert(_ssl_connection, hostname, errMsg);
+            }
+            int reason = SSL_get_error(_ssl_connection, connect_result);
+            bool rc = false;
+            if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE) {
+                rc = true;
+            } else {
+                errMsg = getSSLError(connect_result);
+                rc = false;
+            }
+
+            if (!rc) {
+                return false;
+            }
+        }
+    };
+    bool openSSLCheckServerCert(SSL* ssl, const std::string& hostname, std::string& errMsg) {
+        X509* server_cert = SSL_get_peer_certificate(ssl);
+        if (server_cert == nullptr)
+        {
+            errMsg = "OpenSSL failed - peer didn't present a X509 certificate.";
+            return false;
+        }
+
+        X509_free(server_cert);
+        return true;
+    };
+    bool checkHost(const std::string& host, const char* pattern) {
+        return fnmatch(pattern, host.c_str(), 0) != FNM_NOMATCH;
+    }
+    bool handleTLSOptions(std::string& errMsg) {
+        ERR_clear_error();
+        if (_tlsOptions.hasCertAndKey()) {
+            if (SSL_CTX_use_certificate_chain_file(_ssl_context, _tlsOptions.certFile.c_str()) != 1) {
+                auto sslErr = ERR_get_error();
+                errMsg = "OpenSSL failed - SSL_CTX_use_certificate_chain_file(\"" +
+                            _tlsOptions.certFile + "\") failed: ";
+                errMsg += ERR_error_string(sslErr, nullptr);
+            } else if (SSL_CTX_use_PrivateKey_file(_ssl_context, _tlsOptions.keyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
+                auto sslErr = ERR_get_error();
+                errMsg = "OpenSSL failed - SSL_CTX_use_PrivateKey_file(\"" + _tlsOptions.keyFile +
+                            "\") failed: ";
+                errMsg += ERR_error_string(sslErr, nullptr);
+            } else if (!SSL_CTX_check_private_key(_ssl_context)) {
+                auto sslErr = ERR_get_error();
+                errMsg = "OpenSSL failed - cert/key mismatch(\"" + _tlsOptions.certFile + ", " +
+                            _tlsOptions.keyFile + "\")";
+                errMsg += ERR_error_string(sslErr, nullptr);
+            }
+        }
+
+        ERR_clear_error();
+        if (!_tlsOptions.isPeerVerifyDisabled()) {
+            if (_tlsOptions.isUsingSystemDefaults()) {
+                if (SSL_CTX_set_default_verify_paths(_ssl_context) == 0) {
+                    auto sslErr = ERR_get_error();
+                    errMsg = "OpenSSL failed - SSL_CTX_default_verify_paths loading failed: ";
+                    errMsg += ERR_error_string(sslErr, nullptr);
+                    return false;
+                }
+            } else {
+                if (_tlsOptions.isUsingInMemoryCAs()) {
+                    // Load from memory
+                    openSSLAddCARootsFromString(_tlsOptions.caFile);
+                } else {
+                    if (SSL_CTX_load_verify_locations(_ssl_context, _tlsOptions.caFile.c_str(), NULL) != 1) {
+                        auto sslErr = ERR_get_error();
+                        errMsg = "OpenSSL failed - SSL_CTX_load_verify_locations(\"" +
+                                    _tlsOptions.caFile + "\") failed: ";
+                        errMsg += ERR_error_string(sslErr, nullptr);
+                        return false;
+                    }
+                }
+            }
+
+            SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_PEER, [](int preverify, X509_STORE_CTX*) -> int { return preverify; });
+            SSL_CTX_set_verify_depth(_ssl_context, 4);
+        } else {
+            SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_NONE, nullptr);
+        }
+
+        if (_tlsOptions.isUsingDefaultCiphers()) {
+            if (SSL_CTX_set_cipher_list(_ssl_context, kDefaultCiphers.c_str()) != 1) {
+                auto sslErr = ERR_get_error();
+                errMsg = "OpenSSL failed - SSL_CTX_set_cipher_list(\"" + kDefaultCiphers +
+                            "\") failed: ";
+                errMsg += ERR_error_string(sslErr, nullptr);
+                return false;
+            }
+        } else if (SSL_CTX_set_cipher_list(_ssl_context, _tlsOptions.ciphers.c_str()) != 1) {
+            auto sslErr = ERR_get_error();
+            errMsg = "OpenSSL failed - SSL_CTX_set_cipher_list(\"" + _tlsOptions.ciphers +
+                        "\") failed: ";
+            errMsg += ERR_error_string(sslErr, nullptr);
+            return false;
+        }
+
+        return true;
+    };
+    bool openSSLServerHandshake(std::string& errMsg) {
+        while (true) {
+            if (_ssl_connection == nullptr || _ssl_context == nullptr)
+            {
+                return false;
+            }
+
+            ERR_clear_error();
+            int accept_result = SSL_accept(_ssl_connection);
+            if (accept_result == 1) {
+                return true;
+            }
+            int reason = SSL_get_error(_ssl_connection, accept_result);
+            bool rc = false;
+            if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE) {
+                rc = true;
+            } else {
+                errMsg = getSSLError(accept_result);
+                rc = false;
+            }
+
+            if (!rc) {
+                return false;
+            }
+        }
+    }
+
+    // Required for OpenSSL < 1.1
+    static void openSSLLockingCallback(int mode, int type, const char* /*file*/, int /*line*/){
+        if (mode & CRYPTO_LOCK) {
+            openSSLMutexes[type]->lock();
+        } else {
+            openSSLMutexes[type]->unlock();
+        }
+    }
+
+    SSL* _ssl_connection;
+    SSL_CTX* _ssl_context;
+    const SSL_METHOD* _ssl_method;
+    SocketTLSOptions _tlsOptions;
+    int _sockfd;
+
+    mutable std::mutex _mutex; // OpenSSL routines are not thread-safe
+
+    std::unique_ptr<SelectInterrupt> _selectInterrupt;
+
+    static std::once_flag _openSSLInitFlag;
+    static std::atomic<bool> _openSSLInitializationSuccessful;
+};
+
+std::once_flag SocketOpenSSL::_openSSLInitFlag;
+std::atomic<bool> _openSSLInitializationSuccessful;
+
+
+bool SocketOpenSSL::connect(const std::string& host,
+                            int port,
+                            std::string& errMsg,
+                            const CancellationRequest& isCancellationRequested)
+{
+    bool handshakeSuccessful = false;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        // if (!_openSSLInitializationSuccessful)
+        // {
+        //     errMsg = "OPENSSL_init_ssl failure";
+        //     return false;
+        // }
+
+        _sockfd = SocketConnect::connect(host, port, errMsg, isCancellationRequested);
+        if (_sockfd == -1) return false;
+
+        _ssl_context = openSSLCreateContext(errMsg);
+        if (_ssl_context == nullptr)
+        {
+            return false;
+        }
+
+        if (!handleTLSOptions(errMsg))
+        {
+            return false;
+        }
+
+        _ssl_connection = SSL_new(_ssl_context);
+        if (_ssl_connection == nullptr)
+        {
+            errMsg = "OpenSSL failed to connect";
+            SSL_CTX_free(_ssl_context);
+            _ssl_context = nullptr;
+            return false;
+        }
+        SSL_set_fd(_ssl_connection, _sockfd);
+
+        // SNI support
+        SSL_set_tlsext_host_name(_ssl_connection, host.c_str());
+
+        // Support for server name verification
+        // (The docs say that this should work from 1.0.2, and is the default from
+        // 1.1.0, but it does not. To be on the safe side, the manual test
+        // below is enabled for all versions prior to 1.1.0.)
+        X509_VERIFY_PARAM* param = SSL_get0_param(_ssl_connection);
+        X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
+        handshakeSuccessful = openSSLClientHandshake(host, errMsg, isCancellationRequested);
+    }
+
+    if (!handshakeSuccessful)
+    {
+        close();
+        return false;
+    }
+
+    return true;
+}
+
+void SocketOpenSSL::close()
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (_ssl_connection != nullptr)
+    {
+        SSL_free(_ssl_connection);
+        _ssl_connection = nullptr;
+    }
+    if (_ssl_context != nullptr)
+    {
+        SSL_CTX_free(_ssl_context);
+        _ssl_context = nullptr;
+    }
+
+    Socket::close();
+}
+
+ssize_t SocketOpenSSL::send(char* buf, size_t nbyte)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (_ssl_connection == nullptr || _ssl_context == nullptr)
+    {
+        return 0;
+    }
+
+    ERR_clear_error();
+    ssize_t write_result = SSL_write(_ssl_connection, buf, (int) nbyte);
+    int reason = SSL_get_error(_ssl_connection, (int) write_result);
+
+    if (reason == SSL_ERROR_NONE)
+    {
+        return write_result;
+    }
+    else if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE)
+    {
+        errno = EWOULDBLOCK;
+        return -1;
+    }
+    else
+    {
+        return -1;
+    }
+}
+
+ssize_t SocketOpenSSL::recv(void* buf, size_t nbyte)
+{
+    while (true)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        if (_ssl_connection == nullptr || _ssl_context == nullptr)
+        {
+            return 0;
+        }
+
+        ERR_clear_error();
+        ssize_t read_result = SSL_read(_ssl_connection, buf, (int) nbyte);
+
+        if (read_result > 0)
+        {
+            return read_result;
+        }
+
+        int reason = SSL_get_error(_ssl_connection, (int) read_result);
+
+        if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE)
+        {
+            errno = EWOULDBLOCK;
+        }
+        return -1;
+    }
+}
+
+class websocket_client final {
 public:
     websocket_client() {
     };
@@ -155,26 +1071,22 @@ public:
         // }
     };
 
-    void connect(const std::string& url, const headers& h, int timeoutSecs){
+    void connect_to_url(const std::string& url, const headers& h, int timeout_secs){
             std::string protocol, host;
             int port;
             std::string url_copy(url);
             parse_url(protocol, host, port, url_copy);
-    //     
-    //     const int maxRedirections = 10;
-    //     for (int i = 0; i < maxRedirections; ++i)
-    //     {
-    //         // Parse the URL
-    //         if (!UrlParser::parse(remoteUrl, protocol, host, path, query, port))
-    //         {
-    //             std::stringstream ss;
-    //             ss << "Could not parse url: '" << url << "'";
-    //             throw std::excpetion(ss.str());
-    //         }
+            if (protocol != "wss") {
+                throw std::runtime_error("Invalid protocol: " + protocol);
+            }
+        
+            const int max_redirections = 10;
+            for (int i = 0; i < max_redirections; ++i)
+            {
 
-    //         std::string errorMsg;
-    //         bool tls = protocol == "wss";
-    //         _socket = createSocket(tls, -1, errorMsg, _socketTLSOptions);
+            std::string error_msg;
+            SocketTLSOptions tlsOptions;
+            m_socket = std::unique_ptr<SocketOpenSSL>(new SocketOpenSSL(tlsOptions, -1));
     //         _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
 
     //         if (!_socket)
@@ -212,9 +1124,8 @@ public:
     //             setReadyState(ReadyState::OPEN);
     //         }
     //         return result;
-    //     }
+        }
 
-    //     return result;
     };
     void set_on_message_callback(const std::function<void(const std::string&)>& callback);
 
@@ -236,6 +1147,7 @@ public:
     };
 private:
     std::string m_url;
+    std::unique_ptr<SocketOpenSSL> m_socket;
 };
 
 int main() {
