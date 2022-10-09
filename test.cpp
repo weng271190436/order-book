@@ -39,7 +39,7 @@ const std::string kDefaultCiphers =
 using CancellationRequest = std::function<bool()>;
 using SelectInterruptPtr = std::unique_ptr<class SelectInterrupt>;
 
-struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string& errMsg) {
+struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string& err_msg) {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
@@ -49,7 +49,7 @@ struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string&
     struct addrinfo* res;
     int getaddrinfo_result = getaddrinfo(hostname.c_str(), sport.c_str(), &hints, &res);
     if (getaddrinfo_result) {
-        errMsg = gai_strerror(getaddrinfo_result);
+        err_msg = gai_strerror(getaddrinfo_result);
         res = nullptr;
     }
     return res;
@@ -180,7 +180,7 @@ private:
 const int SelectInterruptPipe::kPipeReadIndex = 0;
 const int SelectInterruptPipe::kPipeWriteIndex = 1;
 
-SelectInterruptPtr createSelectInterrupt() {
+SelectInterruptPtr create_select_interrupt() {
     return std::unique_ptr<SelectInterruptPipe>(new SelectInterruptPipe());
 }
 
@@ -298,155 +298,32 @@ public:
         , _ssl_connection(nullptr)
         , _ssl_context(nullptr)
         , _tlsOptions(tlsOptions) {
-        std::call_once(_openSSLInitFlag, &SocketOpenSSL::openSSLInitialize, this);
+        std::call_once(_openSSLInitFlag, &SocketOpenSSL::openssl_initialize, this);
     }
 
     ~SocketOpenSSL() {
         ssl_close();
     };
 
-    bool accept(std::string& errMsg) {
+    bool connect(const std::string& host, int port, std::string& err_msg) {
         bool handshakeSuccessful = false;
         {
             std::lock_guard<std::mutex> lock(_mutex);
-
-            if (!_openSSLInitializationSuccessful) {
-                errMsg = "OPENSSL_init_ssl failure";
+            if (!_openssl_initialization_successful) {
+                err_msg = "OPENSSL_init_ssl failure";
                 return false;
             }
 
-            if (_sockfd == -1) {
-                return false;
-            }
-
-            {
-                const SSL_METHOD* method = SSLv23_server_method();
-                if (method == nullptr)
-                {
-                    errMsg = "SSLv23_server_method failure";
-                    _ssl_context = nullptr;
-                } else {
-                    _ssl_method = method;
-                    _ssl_context = SSL_CTX_new(_ssl_method);
-                    if (_ssl_context) {
-                        SSL_CTX_set_mode(_ssl_context, SSL_MODE_ENABLE_PARTIAL_WRITE);
-                        SSL_CTX_set_mode(_ssl_context, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-                        SSL_CTX_set_options(_ssl_context,
-                                            SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
-                    }
-                }
-            }
-
-            if (_ssl_context == nullptr) {
-                return false;
-            }
-
-            ERR_clear_error();
-            if (_tlsOptions.hasCertAndKey()) {
-                if (SSL_CTX_use_certificate_chain_file(_ssl_context, _tlsOptions.certFile.c_str()) != 1) {
-                    auto sslErr = ERR_get_error();
-                    errMsg = "OpenSSL failed - SSL_CTX_use_certificate_chain_file(\"" +
-                                _tlsOptions.certFile + "\") failed: ";
-                    errMsg += ERR_error_string(sslErr, nullptr);
-                } else if (SSL_CTX_use_PrivateKey_file(_ssl_context, _tlsOptions.keyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
-                    auto sslErr = ERR_get_error();
-                    errMsg = "OpenSSL failed - SSL_CTX_use_PrivateKey_file(\"" +
-                                _tlsOptions.keyFile + "\") failed: ";
-                    errMsg += ERR_error_string(sslErr, nullptr);
-                }
-            }
-
-
-            ERR_clear_error();
-            if (!_tlsOptions.isPeerVerifyDisabled()) {
-                if (_tlsOptions.isUsingSystemDefaults()) {
-                    if (SSL_CTX_set_default_verify_paths(_ssl_context) == 0) {
-                        auto sslErr = ERR_get_error();
-                        errMsg = "OpenSSL failed - SSL_CTX_default_verify_paths loading failed: ";
-                        errMsg += ERR_error_string(sslErr, nullptr);
-                    }
-                } else {
-                    if (_tlsOptions.isUsingInMemoryCAs()) {
-                        // Load from memory
-                        openSSLAddCARootsFromString(_tlsOptions.caFile);
-                    } else {
-                        const char* root_ca_file = _tlsOptions.caFile.c_str();
-                        STACK_OF(X509_NAME) * rootCAs;
-                        rootCAs = SSL_load_client_CA_file(root_ca_file);
-                        if (rootCAs == NULL) {
-                            auto sslErr = ERR_get_error();
-                            errMsg = "OpenSSL failed - SSL_load_client_CA_file('" +
-                                        _tlsOptions.caFile + "') failed: ";
-                            errMsg += ERR_error_string(sslErr, nullptr);
-                        } else {
-                            SSL_CTX_set_client_CA_list(_ssl_context, rootCAs);
-                            if (SSL_CTX_load_verify_locations(_ssl_context, root_ca_file, nullptr) != 1) {
-                                auto sslErr = ERR_get_error();
-                                errMsg = "OpenSSL failed - SSL_CTX_load_verify_locations(\"" +
-                                            _tlsOptions.caFile + "\") failed: ";
-                                errMsg += ERR_error_string(sslErr, nullptr);
-                            }
-                        }
-                    }
-                }
-
-                SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
-                SSL_CTX_set_verify_depth(_ssl_context, 4);
-            } else {
-                SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_NONE, nullptr);
-            }
-            if (_tlsOptions.isUsingDefaultCiphers()) {
-                if (SSL_CTX_set_cipher_list(_ssl_context, kDefaultCiphers.c_str()) != 1) {
-                    return false;
-                }
-            } else if (SSL_CTX_set_cipher_list(_ssl_context, _tlsOptions.ciphers.c_str()) != 1) {
-                return false;
-            }
-
-            _ssl_connection = SSL_new(_ssl_context);
-            if (_ssl_connection == nullptr) {
-                errMsg = "OpenSSL failed to connect";
-                SSL_CTX_free(_ssl_context);
-                _ssl_context = nullptr;
-                return false;
-            }
-
-            SSL_set_ecdh_auto(_ssl_connection, 1);
-            SSL_set_fd(_ssl_connection, _sockfd);
-            handshakeSuccessful = openSSLServerHandshake(errMsg);
-        }
-
-        if (!handshakeSuccessful) {
-            ssl_close();
-            return false;
-        }
-
-        return true;
-    }
-
-    bool connect(const std::string& host, int port, std::string& errMsg) {
-        bool handshakeSuccessful = false;
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
-            if (!_openSSLInitializationSuccessful) {
-                errMsg = "OPENSSL_init_ssl failure";
-                return false;
-            }
-
-            _sockfd = socket_connect(host, port, errMsg);
+            _sockfd = socket_connect(host, port, err_msg);
             if (_sockfd == -1) return false;
-            _ssl_context = openSSLCreateContext(errMsg);
+            _ssl_context = openssl_create_context(err_msg);
             if (_ssl_context == nullptr) {
-                return false;
-            }
-
-            if (!handleTLSOptions(errMsg)) {
                 return false;
             }
 
             _ssl_connection = SSL_new(_ssl_context);
             if (_ssl_connection == nullptr) {
-                errMsg = "OpenSSL failed to connect";
+                err_msg = "OpenSSL failed to connect";
                 SSL_CTX_free(_ssl_context);
                 _ssl_context = nullptr;
                 return false;
@@ -462,7 +339,7 @@ public:
             // below is enabled for all versions prior to 1.1.0.)
             X509_VERIFY_PARAM* param = SSL_get0_param(_ssl_connection);
             X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
-            handshakeSuccessful = openSSLClientHandshake(host, errMsg);
+            handshakeSuccessful = openssl_client_handshake(host, err_msg);
         }
 
         if (!handshakeSuccessful) {
@@ -505,7 +382,7 @@ public:
             return -1;
         }
     };
-    ssize_t ecv(void* buf, size_t nbyte) {
+    ssize_t receive(void* buf, size_t nbyte) {
         while (true)
         {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -554,11 +431,11 @@ private:
         return false;
     }
 
-    int connect_to_address(const struct addrinfo* address, std::string& errMsg) {
-        errMsg = "no error";
+    int connect_to_address(const struct addrinfo* address, std::string& err_msg) {
+        err_msg = "no error";
         socket_t fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd < 0) {
-            errMsg = "Cannot create a socket";
+            err_msg = "Cannot create a socket";
             return -1;
         }
 
@@ -567,7 +444,7 @@ private:
         int res = ::connect(fd, address->ai_addr, address->ai_addrlen);
         if (res == -1 && !is_wait_needed())
         {
-            errMsg = strerror(errno);
+            err_msg = strerror(errno);
             ::close(fd);
             return -1;
         }
@@ -575,7 +452,7 @@ private:
         for (;;) {
             int timeoutMs = 10;
             bool readyToRead = false;
-            SelectInterruptPtr selectInterrupt = createSelectInterrupt();
+            SelectInterruptPtr selectInterrupt = create_select_interrupt();
             PollResultType pollResult = socket_poll(readyToRead, timeoutMs, fd, selectInterrupt);
 
             if (pollResult == PollResultType::Timeout)
@@ -583,13 +460,13 @@ private:
                 continue;
             } else if (pollResult == PollResultType::Error) {
                 ::close(fd);
-                errMsg = std::string("Connect error: ") + strerror(errno);
+                err_msg = std::string("Connect error: ") + strerror(errno);
                 return -1;
             } else if (pollResult == PollResultType::ReadyForWrite) {
                 return fd;
             } else {
                 ::close(fd);
-                errMsg = std::string("Connect error: ") + strerror(errno);
+                err_msg = std::string("Connect error: ") + strerror(errno);
                 return -1;
             }
         }
@@ -657,7 +534,7 @@ private:
                 // Emulation mode: SelectInterrupt neither supports file descriptors nor events
 
                 // Check the selectInterrupt for requests before doing the poll().
-                if (readSelectInterruptRequest(selectInterrupt, &pollResult))
+                if (read_select_interrupt_request(selectInterrupt, &pollResult))
                 {
                     return pollResult;
                 }
@@ -679,13 +556,13 @@ private:
                 // Emulation mode: SelectInterrupt neither supports fd nor events
 
                 // Check the selectInterrupt for requests
-                readSelectInterruptRequest(selectInterrupt, &pollResult);
+                read_select_interrupt_request(selectInterrupt, &pollResult);
             }
         }
         else if ((interruptFd != -1 && fds[1].revents & POLLIN) || (interruptEvent != nullptr && event != nullptr))
         {
             // The InterruptEvent was signaled
-            readSelectInterruptRequest(selectInterrupt, &pollResult);
+            read_select_interrupt_request(selectInterrupt, &pollResult);
         }
         else if (sockfd != -1 && readyToRead && fds[0].revents & POLLIN)
         {
@@ -718,7 +595,7 @@ private:
     }
 
 
-    bool readSelectInterruptRequest(const SelectInterruptPtr& selectInterrupt, PollResultType* pollResult){
+    bool read_select_interrupt_request(const SelectInterruptPtr& selectInterrupt, PollResultType* pollResult){
         uint64_t value = selectInterrupt->read();
 
         if (value == SelectInterrupt::kSendRequest) {
@@ -732,7 +609,7 @@ private:
         return false;
     }
 
-    int socket_connect(const std::string& hostname, int port, std::string& errMsg) {
+    int socket_connect(const std::string& hostname, int port, std::string& err_msg) {
         //
         // First do DNS resolution
         //
@@ -750,7 +627,7 @@ private:
             //
             // Second try to connect to the remote host
             //
-            sockfd = connect_to_address(address, errMsg);
+            sockfd = connect_to_address(address, err_msg);
             if (sockfd != -1)
             {
                 break;
@@ -761,15 +638,15 @@ private:
         return sockfd;
     }
 
-    void openSSLInitialize() {
+    void openssl_initialize() {
         if (!OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, nullptr)) return;
 
         (void) OpenSSL_add_ssl_algorithms();
         (void) SSL_load_error_strings();
 
-        _openSSLInitializationSuccessful = true;
+        _openssl_initialization_successful = true;
     };
-    std::string getSSLError(int ret) {
+    std::string get_ssl_error(int ret) {
         unsigned long e;
         int err = SSL_get_error(_ssl_connection, ret);
         if (err == SSL_ERROR_WANT_CONNECT || err == SSL_ERROR_WANT_ACCEPT) {
@@ -779,9 +656,9 @@ private:
         } else if (err == SSL_ERROR_SYSCALL) {
             e = ERR_get_error();
             if (e > 0) {
-                std::string errMsg("OpenSSL failed - ");
-                errMsg += ERR_error_string(e, nullptr);
-                return errMsg;
+                std::string err_msg("OpenSSL failed - ");
+                err_msg += ERR_error_string(e, nullptr);
+                return err_msg;
             } else if (e == 0 && ret == 0) {
                 return "OpenSSL failed - received early EOF";
             } else {
@@ -789,9 +666,9 @@ private:
             }
         } else if (err == SSL_ERROR_SSL) {
             e = ERR_get_error();
-            std::string errMsg("OpenSSL failed - ");
-            errMsg += ERR_error_string(e, nullptr);
-            return errMsg;
+            std::string err_msg("OpenSSL failed - ");
+            err_msg += ERR_error_string(e, nullptr);
+            return err_msg;
         } else if (err == SSL_ERROR_NONE) {
             return "OpenSSL failed - err none";
         } else if (err == SSL_ERROR_ZERO_RETURN) {
@@ -800,10 +677,10 @@ private:
             return "OpenSSL failed - unknown error";
         }
     };
-    SSL_CTX* openSSLCreateContext(std::string& errMsg) {
+    SSL_CTX* openssl_create_context(std::string& err_msg) {
         const SSL_METHOD* method = SSLv23_client_method();
         if (method == nullptr) {
-            errMsg = "SSLv23_client_method failure";
+            err_msg = "SSLv23_client_method failure";
             return nullptr;
         }
         _ssl_method = method;
@@ -818,59 +695,7 @@ private:
         return ctx;
     }
 
-    bool openSSLAddCARootsFromString(const std::string roots) {
-        // Create certificate store
-        X509_STORE* certificate_store = SSL_CTX_get_cert_store(_ssl_context);
-        if (certificate_store == nullptr) return false;
-
-        // Configure to allow intermediate certs
-        X509_STORE_set_flags(certificate_store, X509_V_FLAG_TRUSTED_FIRST | X509_V_FLAG_PARTIAL_CHAIN);
-
-        // Create a new buffer and populate it with the roots
-        BIO* buffer = BIO_new_mem_buf((void*) roots.c_str(), static_cast<int>(roots.length()));
-        if (buffer == nullptr) return false;
-
-        // Read each root in the buffer and add to the certificate store
-        bool success = true;
-        size_t number_of_roots = 0;
-
-        while (true) {
-            // Read the next root in the buffer
-            X509* root = PEM_read_bio_X509_AUX(buffer, nullptr, nullptr, (void*) "");
-            if (root == nullptr) {
-                // No more certs left in the buffer, we're done.
-                ERR_clear_error();
-                break;
-            }
-
-            // Try adding the root to the certificate store
-            ERR_clear_error();
-            if (!X509_STORE_add_cert(certificate_store, root)) {
-                // Failed to add. If the error is unrelated to the x509 lib or the cert already
-                // exists, we're safe to continue.
-                unsigned long error = ERR_get_error();
-                if (ERR_GET_LIB(error) != ERR_LIB_X509 || ERR_GET_REASON(error) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
-                    // Failed. Clean up and bail.
-                    success = false;
-                    X509_free(root);
-                    break;
-                }
-            }
-
-            // Clean up and loop
-            X509_free(root);
-            number_of_roots++;
-        }
-
-        // Clean up buffer
-        BIO_free(buffer);
-
-        // Make sure we loaded at least one certificate.
-        if (number_of_roots == 0) success = false;
-
-        return success;
-    };
-    bool openSSLClientHandshake(const std::string& hostname, std::string& errMsg) {
+    bool openssl_client_handshake(const std::string& hostname, std::string& err_msg) {
         while (true) {
             if (_ssl_connection == nullptr || _ssl_context == nullptr) {
                 return false;
@@ -879,14 +704,14 @@ private:
             ERR_clear_error();
             int connect_result = SSL_connect(_ssl_connection);
             if (connect_result == 1) {
-                return openSSLCheckServerCert(_ssl_connection, hostname, errMsg);
+                return openssl_check_server_cert(_ssl_connection, hostname, err_msg);
             }
             int reason = SSL_get_error(_ssl_connection, connect_result);
             bool rc = false;
             if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE) {
                 rc = true;
             } else {
-                errMsg = getSSLError(connect_result);
+                err_msg = get_ssl_error(connect_result);
                 rc = false;
             }
 
@@ -895,90 +720,21 @@ private:
             }
         }
     };
-    bool openSSLCheckServerCert(SSL* ssl, const std::string& hostname, std::string& errMsg) {
+    bool openssl_check_server_cert(SSL* ssl, const std::string& hostname, std::string& err_msg) {
         X509* server_cert = SSL_get_peer_certificate(ssl);
         if (server_cert == nullptr)
         {
-            errMsg = "OpenSSL failed - peer didn't present a X509 certificate.";
+            err_msg = "OpenSSL failed - peer didn't present a X509 certificate.";
             return false;
         }
 
         X509_free(server_cert);
         return true;
     };
-    bool checkHost(const std::string& host, const char* pattern) {
+    bool check_host(const std::string& host, const char* pattern) {
         return fnmatch(pattern, host.c_str(), 0) != FNM_NOMATCH;
     }
-    bool handleTLSOptions(std::string& errMsg) {
-        ERR_clear_error();
-        if (_tlsOptions.hasCertAndKey()) {
-            if (SSL_CTX_use_certificate_chain_file(_ssl_context, _tlsOptions.certFile.c_str()) != 1) {
-                auto sslErr = ERR_get_error();
-                errMsg = "OpenSSL failed - SSL_CTX_use_certificate_chain_file(\"" +
-                            _tlsOptions.certFile + "\") failed: ";
-                errMsg += ERR_error_string(sslErr, nullptr);
-            } else if (SSL_CTX_use_PrivateKey_file(_ssl_context, _tlsOptions.keyFile.c_str(), SSL_FILETYPE_PEM) != 1) {
-                auto sslErr = ERR_get_error();
-                errMsg = "OpenSSL failed - SSL_CTX_use_PrivateKey_file(\"" + _tlsOptions.keyFile +
-                            "\") failed: ";
-                errMsg += ERR_error_string(sslErr, nullptr);
-            } else if (!SSL_CTX_check_private_key(_ssl_context)) {
-                auto sslErr = ERR_get_error();
-                errMsg = "OpenSSL failed - cert/key mismatch(\"" + _tlsOptions.certFile + ", " +
-                            _tlsOptions.keyFile + "\")";
-                errMsg += ERR_error_string(sslErr, nullptr);
-            }
-        }
-
-        ERR_clear_error();
-        if (!_tlsOptions.isPeerVerifyDisabled()) {
-            if (_tlsOptions.isUsingSystemDefaults()) {
-                if (SSL_CTX_set_default_verify_paths(_ssl_context) == 0) {
-                    auto sslErr = ERR_get_error();
-                    errMsg = "OpenSSL failed - SSL_CTX_default_verify_paths loading failed: ";
-                    errMsg += ERR_error_string(sslErr, nullptr);
-                    return false;
-                }
-            } else {
-                if (_tlsOptions.isUsingInMemoryCAs()) {
-                    // Load from memory
-                    openSSLAddCARootsFromString(_tlsOptions.caFile);
-                } else {
-                    if (SSL_CTX_load_verify_locations(_ssl_context, _tlsOptions.caFile.c_str(), NULL) != 1) {
-                        auto sslErr = ERR_get_error();
-                        errMsg = "OpenSSL failed - SSL_CTX_load_verify_locations(\"" +
-                                    _tlsOptions.caFile + "\") failed: ";
-                        errMsg += ERR_error_string(sslErr, nullptr);
-                        return false;
-                    }
-                }
-            }
-
-            SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_PEER, [](int preverify, X509_STORE_CTX*) -> int { return preverify; });
-            SSL_CTX_set_verify_depth(_ssl_context, 4);
-        } else {
-            SSL_CTX_set_verify(_ssl_context, SSL_VERIFY_NONE, nullptr);
-        }
-
-        if (_tlsOptions.isUsingDefaultCiphers()) {
-            if (SSL_CTX_set_cipher_list(_ssl_context, kDefaultCiphers.c_str()) != 1) {
-                auto sslErr = ERR_get_error();
-                errMsg = "OpenSSL failed - SSL_CTX_set_cipher_list(\"" + kDefaultCiphers +
-                            "\") failed: ";
-                errMsg += ERR_error_string(sslErr, nullptr);
-                return false;
-            }
-        } else if (SSL_CTX_set_cipher_list(_ssl_context, _tlsOptions.ciphers.c_str()) != 1) {
-            auto sslErr = ERR_get_error();
-            errMsg = "OpenSSL failed - SSL_CTX_set_cipher_list(\"" + _tlsOptions.ciphers +
-                        "\") failed: ";
-            errMsg += ERR_error_string(sslErr, nullptr);
-            return false;
-        }
-
-        return true;
-    };
-    bool openSSLServerHandshake(std::string& errMsg) {
+    bool openssl_server_handshake(std::string& err_msg) {
         while (true) {
             if (_ssl_connection == nullptr || _ssl_context == nullptr)
             {
@@ -995,7 +751,7 @@ private:
             if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE) {
                 rc = true;
             } else {
-                errMsg = getSSLError(accept_result);
+                err_msg = get_ssl_error(accept_result);
                 rc = false;
             }
 
@@ -1017,11 +773,11 @@ private:
     SelectInterruptPtr _selectInterrupt;
 
     static std::once_flag _openSSLInitFlag;
-    static std::atomic<bool> _openSSLInitializationSuccessful;
+    static std::atomic<bool> _openssl_initialization_successful;
 };
 
 std::once_flag SocketOpenSSL::_openSSLInitFlag;
-std::atomic<bool> SocketOpenSSL::_openSSLInitializationSuccessful(false);
+std::atomic<bool> SocketOpenSSL::_openssl_initialization_successful(false);
 
 class websocket_client final {
 public:
@@ -1187,7 +943,7 @@ public:
 
             std::string error_msg;
             SocketTLSOptions tlsOptions;
-            m_socket = std::unique_ptr<SocketOpenSSL>(new SocketOpenSSL(tlsOptions, -1));
+            _tls_socket = std::unique_ptr<SocketOpenSSL>(new SocketOpenSSL(tlsOptions, -1));
     //         _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
 
     //         if (!_socket)
@@ -1248,7 +1004,7 @@ public:
     };
 private:
     std::string m_url;
-    std::unique_ptr<SocketOpenSSL> m_socket;
+    std::unique_ptr<SocketOpenSSL> _tls_socket;
 };
 
 int main() {
