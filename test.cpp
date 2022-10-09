@@ -340,13 +340,25 @@ enum class ReadyState {
     OPEN
 };
 
-enum OpcodeType{
-    CONTINUATION = 0x0,
-    TEXT_FRAME = 0x1,
-    BINARY_FRAME = 0x2,
-    CLOSE = 8,
-    PING = 9,
-    PONG = 0xa,
+struct WebSocketHeader {
+    unsigned header_size;
+    bool fin;
+    bool rsv1;
+    bool rsv2;
+    bool rsv3;
+    bool mask;
+    enum OpcodeType
+    {
+        CONTINUATION = 0x0,
+        TEXT_FRAME = 0x1,
+        BINARY_FRAME = 0x2,
+        CLOSE = 8,
+        PING = 9,
+        PONG = 0xa,
+    } opcode;
+    int N0;
+    uint64_t N;
+    uint8_t masking_key[4];
 };
 
 std::string trim(const std::string &s)
@@ -474,7 +486,7 @@ public:
         header.assign(2 + (message_size >= 126 ? 2 : 0) + (message_size >= 65536 ? 6 : 0) +
                           (use_mask ? 4 : 0),
                       0);
-        header[0] = OpcodeType::TEXT_FRAME;
+        header[0] = WebSocketHeader::OpcodeType::TEXT_FRAME;
         header[0] |= 0x80;
 
         if (message_size < 126) {
@@ -572,69 +584,8 @@ public:
                 }
             }
         }
-    }
 
-    void run() {
-        while (true) {
-            if (_ready_state == ReadyState::CLOSED) {
-                throw std::runtime_error("web socket is closed so cannot run");
-            }
-
-            // 2. Poll to see if there's any new data available
-            // WebSocketTransport::PollResult pollResult = _ws.poll();
-
-            // 3. Dispatch the incoming messages
-            // _ws.dispatch(
-            //     pollResult,
-            //     [this](const std::string& msg,
-            //            size_t wireSize,
-            //            bool decompressionError,
-            //            WebSocketTransport::MessageKind messageKind) {
-            //         WebSocketMessageType webSocketMessageType{WebSocketMessageType::Error};
-            //         switch (messageKind)
-            //         {
-            //             case WebSocketTransport::MessageKind::MSG_TEXT:
-            //             case WebSocketTransport::MessageKind::MSG_BINARY:
-            //             {
-            //                 webSocketMessageType = WebSocketMessageType::Message;
-            //             }
-            //             break;
-
-            //             case WebSocketTransport::MessageKind::PING:
-            //             {
-            //                 webSocketMessageType = WebSocketMessageType::Ping;
-            //             }
-            //             break;
-
-            //             case WebSocketTransport::MessageKind::PONG:
-            //             {
-            //                 webSocketMessageType = WebSocketMessageType::Pong;
-            //             }
-            //             break;
-
-            //             case WebSocketTransport::MessageKind::FRAGMENT:
-            //             {
-            //                 webSocketMessageType = WebSocketMessageType::Fragment;
-            //             }
-            //             break;
-            //         }
-
-            //         WebSocketErrorInfo webSocketErrorInfo;
-            //         webSocketErrorInfo.decompressionError = decompressionError;
-
-            //         bool binary = messageKind == WebSocketTransport::MessageKind::MSG_BINARY;
-
-            //         _onMessageCallback(ix::make_unique<WebSocketMessage>(webSocketMessageType,
-            //                                                              msg,
-            //                                                              wireSize,
-            //                                                              webSocketErrorInfo,
-            //                                                              WebSocketOpenInfo(),
-            //                                                              WebSocketCloseInfo(),
-            //                                                              binary));
-
-            //         WebSocket::invokeTrafficTrackerCallback(wireSize, true);
-            //     });
-        }
+        read_buffer();
     }
 
     void start_websocket_connection(){
@@ -742,6 +693,82 @@ private:
     void close_socket() {
         std::lock_guard<std::mutex> lock(_socket_mutex);
         _tls_socket->ssl_close();
+    }
+
+    void read_buffer() {
+        WebSocketHeader ws;
+        if (_receive_buffer.size() < 2) return;
+        const uint8_t* data = (uint8_t*) &_receive_buffer[0];
+        ws.fin = (data[0] & 0x80) == 0x80;
+        ws.rsv1 = (data[0] & 0x40) == 0x40;
+        ws.rsv2 = (data[0] & 0x20) == 0x20;
+        ws.rsv3 = (data[0] & 0x10) == 0x10;
+        ws.opcode = (WebSocketHeader::OpcodeType)(data[0] & 0x0f);
+        ws.mask = (data[1] & 0x80) == 0x80;
+        ws.N0 = (data[1] & 0x7f);
+        ws.header_size =
+            2 + (ws.N0 == 126 ? 2 : 0) + (ws.N0 == 127 ? 8 : 0) + (ws.mask ? 4 : 0);
+        if (_receive_buffer.size() < ws.header_size) {
+            std::cout << "buffer size smaller than header size" << std::endl;
+            return;
+        }
+
+        if (ws.rsv1 || ws.rsv2 || ws.rsv3) {
+            throw std::runtime_error("reserved bits used");
+        }
+
+        //
+        // Calculate payload length:
+        // 0-125 mean the payload is that long.
+        // 126 means that the following two bytes indicate the length,
+        // 127 means the next 8 bytes indicate the length.
+        //
+        int i = 0;
+        if (ws.N0 < 126) {
+            ws.N = ws.N0;
+            i = 2;
+        } else if (ws.N0 == 126) {
+            ws.N = 0;
+            ws.N |= ((uint64_t) data[2]) << 8;
+            ws.N |= ((uint64_t) data[3]) << 0;
+            i = 4;
+        } else if (ws.N0 == 127) {
+            ws.N = 0;
+            ws.N |= ((uint64_t) data[2]) << 56;
+            ws.N |= ((uint64_t) data[3]) << 48;
+            ws.N |= ((uint64_t) data[4]) << 40;
+            ws.N |= ((uint64_t) data[5]) << 32;
+            ws.N |= ((uint64_t) data[6]) << 24;
+            ws.N |= ((uint64_t) data[7]) << 16;
+            ws.N |= ((uint64_t) data[8]) << 8;
+            ws.N |= ((uint64_t) data[9]) << 0;
+            i = 10;
+        } else {
+            throw std::runtime_error("invalid payload length");
+        }
+
+        if (ws.mask) {
+            ws.masking_key[0] = ((uint8_t) data[i + 0]) << 0;
+            ws.masking_key[1] = ((uint8_t) data[i + 1]) << 0;
+            ws.masking_key[2] = ((uint8_t) data[i + 2]) << 0;
+            ws.masking_key[3] = ((uint8_t) data[i + 3]) << 0;
+        } else {
+            ws.masking_key[0] = 0;
+            ws.masking_key[1] = 0;
+            ws.masking_key[2] = 0;
+            ws.masking_key[3] = 0;
+        }
+
+        // Prevent integer overflow in the next conditional
+        const uint64_t max_frame_size(1ULL << 63);
+        if (ws.N > max_frame_size) {
+            throw std::runtime_error("frame too large");
+        }
+
+        if (_receive_buffer.size() < ws.header_size + ws.N) {
+            std::cout << "buffer size smaller than frame size" << std::endl;
+            return;
+        }
     }
 };
 
