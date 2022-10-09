@@ -315,6 +315,10 @@ private:
             err_msg = "openssl failed - server didn't present a X509 certificate.";
             return false;
         }
+        
+        char buf[256];
+        X509_NAME_oneline(X509_get_subject_name(server_cert), buf, 256);
+        std::cout << "openssl server cert subject: " << buf << std::endl;
 
         X509_free(server_cert);
         return true;
