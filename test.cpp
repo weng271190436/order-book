@@ -4,6 +4,7 @@
 #include <mutex>
 #include <cstring>
 #include <thread>
+#include <sstream>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -11,6 +12,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 
 typedef std::unordered_map<std::string, std::string> headers;
 typedef int socket_t;
@@ -33,19 +35,12 @@ struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string&
 
 class SecureSocket {
 public:
-    SecureSocket(int fd = -1)
-        : _sockfd(fd)
-        , _ssl_connection(nullptr)
-        , _ssl_context(nullptr) {
+    SecureSocket(){
         std::call_once(_openssl_init_flag, &SecureSocket::openssl_initialize, this);
     }
 
     ~SecureSocket() {
         ssl_close();
-    };
-
-    bool init(std::string& errorMsg) {
-        return true;
     };
 
     bool ssl_connect(const std::string& host, int port, std::string& err_msg) {
@@ -101,6 +96,25 @@ public:
         socket_close();
     };
 
+    bool write_bytes(const std::string& str) {
+        int offset = 0;
+        ssize_t len = str.size();
+        while (true) {
+            ssize_t ret = send((char*) &str[offset], len);
+            if (ret > 0){
+                if (ret == len) {
+                    return true;
+                } else {
+                    offset += ret;
+                    len -= ret;
+                    continue;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
     ssize_t send(char* buf, size_t nbyte){
         std::lock_guard<std::mutex> lock(_mutex);
         if (_ssl_connection == nullptr || _ssl_context == nullptr) {
@@ -120,9 +134,33 @@ public:
             return -1;
         }
     };
+
+    bool read_byte(void* buffer) {
+        while (true) {
+            ssize_t ret = receive(buffer, 1);
+            if (ret == 1) {
+                return true;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    std::pair<bool, std::string> read_line() {
+        char c;
+        std::string line;
+        line.reserve(64);
+        for (int i = 0; i < 2 || (line[i - 2] != '\r' && line[i - 1] != '\n'); ++i) {
+            if (!read_byte(&c)) {
+                return std::make_pair(false, line);
+            }
+            line += c;
+        }
+        return std::make_pair(true, line);
+    }
+
     ssize_t receive(void* buf, size_t nbyte) {
-        while (true)
-        {
+        while (true) {
             std::lock_guard<std::mutex> lock(_mutex);
             if (_ssl_connection == nullptr || _ssl_context == nullptr) {
                 return 0;
@@ -158,6 +196,8 @@ private:
             return -1;
         }
 
+        int flag = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char*) &flag, sizeof(flag));
         int res = ::connect(fd, address->ai_addr, address->ai_addrlen);
         if (res == -1) {
             err_msg = strerror(errno);
@@ -195,37 +235,39 @@ private:
 
         _openssl_initialization_successful = true;
     };
+
     std::string get_ssl_error(int ret) {
         unsigned long e;
         int err = SSL_get_error(_ssl_connection, ret);
         if (err == SSL_ERROR_WANT_CONNECT || err == SSL_ERROR_WANT_ACCEPT) {
-            return "OpenSSL failed - connection failure";
+            return "openssl failed - connection failure";
         } else if (err == SSL_ERROR_WANT_X509_LOOKUP) {
-            return "OpenSSL failed - x509 error";
+            return "openssl failed - x509 error";
         } else if (err == SSL_ERROR_SYSCALL) {
             e = ERR_get_error();
             if (e > 0) {
-                std::string err_msg("OpenSSL failed - ");
+                std::string err_msg("openssl failed - ");
                 err_msg += ERR_error_string(e, nullptr);
                 return err_msg;
             } else if (e == 0 && ret == 0) {
-                return "OpenSSL failed - received early EOF";
+                return "openssl failed - received early EOF";
             } else {
-                return "OpenSSL failed - underlying BIO reported an I/O error";
+                return "openssl failed - underlying BIO reported an I/O error";
             }
         } else if (err == SSL_ERROR_SSL) {
             e = ERR_get_error();
-            std::string err_msg("OpenSSL failed - ");
+            std::string err_msg("openssl failed - ");
             err_msg += ERR_error_string(e, nullptr);
             return err_msg;
         } else if (err == SSL_ERROR_NONE) {
-            return "OpenSSL failed - err none";
+            return "openssl failed - err none";
         } else if (err == SSL_ERROR_ZERO_RETURN) {
-            return "OpenSSL failed - err zero return";
+            return "openssl failed - err zero return";
         } else {
-            return "OpenSSL failed - unknown error";
+            return "openssl failed - unknown error";
         }
     };
+
     SSL_CTX* openssl_create_context(std::string& err_msg) {
         const SSL_METHOD* method = SSLv23_client_method();
         if (method == nullptr) {
@@ -272,7 +314,7 @@ private:
     bool openssl_check_server_cert(SSL* ssl, const std::string& hostname, std::string& err_msg) {
         X509* server_cert = SSL_get_peer_certificate(ssl);
         if (server_cert == nullptr) {
-            err_msg = "OpenSSL failed - peer didn't present a X509 certificate.";
+            err_msg = "openssl failed - server didn't present a X509 certificate.";
             return false;
         }
 
@@ -280,9 +322,9 @@ private:
         return true;
     };
 
-    int _sockfd;
-    SSL* _ssl_connection;
-    SSL_CTX* _ssl_context;
+    int _sockfd = -1;
+    SSL* _ssl_connection = nullptr;
+    SSL_CTX* _ssl_context = nullptr;
     const SSL_METHOD* _ssl_method;
 
     mutable std::mutex _mutex;
@@ -295,6 +337,92 @@ private:
 std::once_flag SecureSocket::_openssl_init_flag;
 std::atomic<bool> SecureSocket::_openssl_initialization_successful(false);
 
+enum class ReadyState {
+    CLOSING,
+    CLOSED,
+    CONNECTING,
+    OPEN
+};
+
+std::string trim(const std::string &s)
+{
+    auto start = s.begin();
+    while (start != s.end() && std::isspace(*start)) {
+        start++;
+    }
+ 
+    auto end = s.end();
+    do {
+        end--;
+    } while (std::distance(start, end) > 0 && std::isspace(*end));
+ 
+    return std::string(start, end + 1);
+}
+
+std::pair<std::string, int> parse_http_status(const std::string& line) {
+    std::string token;
+    std::stringstream ts(line);
+    std::vector<std::string> tokens;
+    while (std::getline(ts, token, ' ')) {
+        tokens.push_back(token);
+    }
+
+    std::string http_version;
+    if (tokens.size() >= 1){
+        http_version = trim(tokens[0]);
+    }
+
+    int status_code = -1;
+    if (tokens.size() >= 2) {
+        std::stringstream ss;
+        ss << trim(tokens[1]);
+        ss >> status_code;
+    }
+
+    return std::make_pair(http_version, status_code);
+}
+
+std::pair<bool, headers> read_and_parse_headers(std::unique_ptr<SecureSocket>& socket) {
+    headers headers;
+    char line[1024];
+    int i;
+    while (true) {
+        int colon = 0;
+        for (i = 0; i < 2 || (i < 1023 && line[i - 2] != '\r' && line[i - 1] != '\n'); ++i) {
+            if (!socket->read_byte(line + i)) {
+                return std::make_pair(false, headers);
+            }
+
+            if (line[i] == ':' && colon == 0) {
+                colon = i;
+            }
+        }
+        if (line[0] == '\r' && line[1] == '\n'){
+            break;
+        }
+        if (colon > 0) {
+            line[i] = '\0';
+            std::string line_str(line);
+            int start = colon + 1;
+            while (line_str[start] == ' ') {
+                start++;
+            }
+
+            std::string name(line_str.substr(0, colon));
+            for (auto& c : name) {
+                c = std::tolower(c);
+            }
+            std::string value(line_str.substr(start, line_str.size() - start - 2));
+            for (auto& c : value) {
+                c = std::tolower(c);
+            }
+            headers[name] = value;
+        }
+    }
+
+    return std::make_pair(true, headers);
+}
+
 class WebSocketClient final {
 public:
     WebSocketClient() {
@@ -304,7 +432,9 @@ public:
     void connect();
     void disconnect();
     void set_url(const std::string& url) { m_url = url; };
-    void send(const std::string& message);
+    void send(const std::string& message) {
+
+    };
     void run() {
         // while (true)
         // {
@@ -444,62 +574,87 @@ public:
         // }
     };
 
-    void connect_to_url(const std::string& url, const headers& h, int timeout_secs){
+    void start_websocket_connection(const std::string& url, const headers& h, int timeout_secs){
         std::string protocol, host;
         int port;
         std::string url_copy(url);
         parse_url(protocol, host, port, url_copy);
         if (protocol != "wss") {
-            throw std::runtime_error("Invalid protocol: " + protocol);
+            throw std::runtime_error("invalid protocol: " + protocol);
         }
     
-        const int max_redirections = 10;
-        for (int i = 0; i < max_redirections; ++i) {
-            std::string error_msg;
-            _tls_socket = std::unique_ptr<SecureSocket>(new SecureSocket(-1));
-            if (!_tls_socket->init(error_msg)) {
-                _tls_socket.reset();
-            }
-            // _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
-
-    //         if (!_socket)
-    //         {
-    //             return WebSocketInitResult(false, 0, errorMsg);
-    //         }
-
-    //         WebSocketHandshake webSocketHandshake(_requestInitCancellation,
-    //                                               _socket,
-    //                                               _perMessageDeflate,
-    //                                               _perMessageDeflateOptions,
-    //                                               _enablePerMessageDeflate);
-
-    //         result = webSocketHandshake.clientHandshake(
-    //             remoteUrl, headers, host, path, port, timeoutSecs);
-
-    //         if (result.http_status >= 300 && result.http_status < 400)
-    //         {
-    //             auto it = result.headers.find("Location");
-    //             if (it == result.headers.end())
-    //             {
-    //                 std::stringstream ss;
-    //                 ss << "Missing Location Header for HTTP Redirect response. "
-    //                    << "Rejecting connection to " << url << ", status: " << result.http_status;
-    //                 result.errorStr = ss.str();
-    //                 break;
-    //             }
-
-    //             remoteUrl = it->second;
-    //             continue;
-    //         }
-
-    //         if (result.success)
-    //         {
-    //             setReadyState(ReadyState::OPEN);
-    //         }
-    //         return result;
+        std::string error_msg;
+        _tls_socket = std::unique_ptr<SecureSocket>(new SecureSocket());
+        bool success = _tls_socket->ssl_connect(host, port, error_msg);
+        if (!success) {
+            std::stringstream ss;
+            ss << "unable to connect to " << host << " on port " << port << ", error: " << error_msg;
+            throw std::runtime_error(ss.str());
         }
 
+        std::stringstream ss;
+        ss << "GET / HTTP/1.1\r\n";
+        ss << "Host: " << host << ":" << port << "\r\n";
+        ss << "Upgrade: websocket\r\n";
+        ss << "Connection: Upgrade\r\n";
+        ss << "Sec-WebSocket-Version: 13\r\n";
+        ss << "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n";
+        ss << "User-Agent: WeiWebSocket/1.0\r\n";
+        ss << "\r\n";
+
+        if (!_tls_socket->write_bytes(ss.str())) {
+            throw std::runtime_error("failed sending GET request to " + url);
+        }
+
+        auto status_line = _tls_socket->read_line();
+        bool line_valid = status_line.first;
+        std::string line = status_line.second;
+
+        if (!line_valid) {
+            throw std::runtime_error("failed reading HTTP status line from " + url);
+        }
+
+        auto http_version_status = parse_http_status(line);
+        std::string version = http_version_status.first;
+        int status = http_version_status.second;
+
+        if (version != "HTTP/1.1") {
+            std::stringstream ss;
+            ss << "http version is not 1.1 but " << version << ", status: " << status
+               << ", http status line: " << line;
+            throw std::runtime_error(ss.str());
+        }
+
+        auto result = read_and_parse_headers(_tls_socket);
+        auto headers_valid = result.first;
+        auto headers = result.second;
+
+        if (!headers_valid){
+            std::stringstream ss;
+            throw std::runtime_error("failed parsing headers");
+        }
+
+        if (status != 101) {
+            std::stringstream ss;
+            ss << "status is not 101, got " << status
+               << " status connecting to " << url << ", http status line: " << line;
+            throw std::runtime_error(ss.str());
+        }
+
+        if (headers.find("connection") == headers.end())
+        {
+            throw std::runtime_error("no connection in header");
+        }
+
+        if (headers["connection"] != "upgrade") {
+            std::stringstream ss;
+            ss << "invalid connection value: " << headers["connection"];
+            throw std::runtime_error(ss.str());
+        }
+
+        _ready_state = ReadyState::OPEN;
     };
+
     void set_on_message_callback(const std::function<void(const std::string&)>& callback);
 
     void parse_url(std::string& protocol, std::string& host, int& port, const std::string& url) {
@@ -521,6 +676,7 @@ public:
 private:
     std::string m_url;
     std::unique_ptr<SecureSocket> _tls_socket;
+    ReadyState _ready_state;
 };
 
 int main() {
@@ -536,11 +692,11 @@ int main() {
     struct sockaddr_in* addr = (struct sockaddr_in *)address_info->ai_addr; 
     std::cout << "IP address: " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
 
-    SecureSocket s(-1);
+    SecureSocket s;
     std::string socket_err_msg;
     bool ssl_connect_success = s.ssl_connect(host, port, socket_err_msg);
     std::cout << "ssl connect success: " << std::boolalpha << ssl_connect_success << std::endl;
     std::cout << "socket err msg: " << socket_err_msg << std::endl;
 
-    c.connect_to_url(url, headers(), 10);
+    c.start_websocket_connection(url, headers(), 10);
 }
