@@ -428,13 +428,31 @@ std::pair<bool, headers> read_and_parse_headers(std::unique_ptr<SecureSocket>& s
     return std::make_pair(true, headers);
 }
 
-class WebSocketClient final {
+
+void parse_url(std::string& protocol, std::string& host, int& port, const std::string& url) {
+    std::string::size_type pos = url.find("://");
+    if (pos == std::string::npos) {
+        throw std::runtime_error("invalid url");
+    }
+    protocol = url.substr(0, pos);
+    std::string::size_type pos2 = url.find(":", pos + 3);
+    if (pos2 == std::string::npos) {
+        throw std::runtime_error("invalid url");
+    }
+    host = url.substr(pos + 3, pos2 - pos - 3);
+    port = stoi(url.substr(pos2 + 1));
+    std::cout << "protocol: " << protocol << std::endl;
+    std::cout << "host: " << host << std::endl;
+    std::cout << "port: " << port << std::endl;
+};
+
+class CoinbaseWebSocketClient final {
 public:
-    WebSocketClient(const std::string& url) :
+    CoinbaseWebSocketClient(const std::string& url) :
     _url(url),
     _ready_state(ReadyState::CLOSED) {
     };
-    ~WebSocketClient() {
+    ~CoinbaseWebSocketClient() {
     };
     void connect();
     void disconnect();
@@ -515,8 +533,7 @@ public:
                 if (ret < 0){
                     throw std::runtime_error("send failed with return code" + std::to_string(ret));
                 } else if (ret <= 0) {
-                    std::lock_guard<std::mutex> lock(_socket_mutex);
-                    _tls_socket->ssl_close();
+                    close_socket();
                     _ready_state = ReadyState::CLOSED;
                 } else {
                     _send_buffer.erase(_send_buffer.begin(), _send_buffer.begin() + ret);
@@ -526,144 +543,99 @@ public:
         }
     };
 
-    void run() {
-        // while (true)
-        // {
-        //     // 1. Make sure we are always connected
-        //     checkConnection(firstConnectionAttempt);
-
-        //     firstConnectionAttempt = false;
-
-        //     // if here we are closed then checkConnection was not able to connect
-        //     if (getReadyState() == ReadyState::Closed)
-        //     {
-        //         break;
-        //     }
-
-        //     // We can avoid to poll if we want to stop and are not closing
-        //     if (_stop && !isClosing()) break;
-
-        //     // 2. Poll to see if there's any new data available
-        //     WebSocketTransport::PollResult pollResult = _ws.poll();
-
-        //     // 3. Dispatch the incoming messages
-        //     _ws.dispatch(
-        //         pollResult,
-        //         [this](const std::string& msg,
-        //                size_t wireSize,
-        //                bool decompressionError,
-        //                WebSocketTransport::MessageKind messageKind) {
-        //             WebSocketMessageType webSocketMessageType{WebSocketMessageType::Error};
-        //             switch (messageKind)
-        //             {
-        //                 case WebSocketTransport::MessageKind::MSG_TEXT:
-        //                 case WebSocketTransport::MessageKind::MSG_BINARY:
-        //                 {
-        //                     webSocketMessageType = WebSocketMessageType::Message;
-        //                 }
-        //                 break;
-
-        //                 case WebSocketTransport::MessageKind::PING:
-        //                 {
-        //                     webSocketMessageType = WebSocketMessageType::Ping;
-        //                 }
-        //                 break;
-
-        //                 case WebSocketTransport::MessageKind::PONG:
-        //                 {
-        //                     webSocketMessageType = WebSocketMessageType::Pong;
-        //                 }
-        //                 break;
-
-        //                 case WebSocketTransport::MessageKind::FRAGMENT:
-        //                 {
-        //                     webSocketMessageType = WebSocketMessageType::Fragment;
-        //                 }
-        //                 break;
-        //             }
-
-        //             WebSocketErrorInfo webSocketErrorInfo;
-        //             webSocketErrorInfo.decompressionError = decompressionError;
-
-        //             bool binary = messageKind == WebSocketTransport::MessageKind::MSG_BINARY;
-
-        //             _onMessageCallback(ix::make_unique<WebSocketMessage>(webSocketMessageType,
-        //                                                                  msg,
-        //                                                                  wireSize,
-        //                                                                  webSocketErrorInfo,
-        //                                                                  WebSocketOpenInfo(),
-        //                                                                  WebSocketCloseInfo(),
-        //                                                                  binary));
-
-        //             WebSocket::invokeTrafficTrackerCallback(wireSize, true);
-        //         });
-        // }
+    void poll() {
+        {
+            std::lock_guard<std::mutex> lock(_receive_buffer_mutex);
+            while (true) {
+                int current_size = _receive_buffer.size();
+                ssize_t ret;
+                _receive_buffer.resize(current_size + 1500);
+                ret = _tls_socket->receive(&_receive_buffer[current_size], 1500);
+                if (ret < 0 && (errno == EWOULDBLOCK)) {
+                    _receive_buffer.resize(current_size);
+                    break;
+                } else if (ret <= 0) {
+                    _receive_buffer.resize(current_size);
+                    close_socket();
+                    _ready_state = ReadyState::CLOSED;
+                    if (ret < 0) {
+                        throw std::runtime_error("connection error" + std::to_string(ret));
+                    }
+                    throw std::runtime_error("unexpected connection closed" + std::to_string(ret));
+                } else if (current_size > 65536) {
+                    std::cout << "received " << current_size + ret << " bytes" << std::endl;
+                    _receive_buffer.resize(current_size + ret);
+                    break;
+                } else {
+                    std::cout << "received " << ret << " bytes: " << std::string(_receive_buffer.begin() + current_size, _receive_buffer.end()) << std::endl;
+                    _receive_buffer.resize(current_size + ret);
+                }
+            }
+        }
     }
-    void check_connection(bool first_connection_attempt)
-    {
-        // using millis = std::chrono::duration<double, std::milli>;
 
-        // uint32_t retries = 0;
-        // millis duration(0);
+    void run() {
+        while (true) {
+            if (_ready_state == ReadyState::CLOSED) {
+                throw std::runtime_error("web socket is closed so cannot run");
+            }
 
-        // // Try to connect perpertually
-        // while (true)
-        // {
-        //     if (isConnected() || isClosing() || _stop)
-        //     {
-        //         break;
-        //     }
+            // 2. Poll to see if there's any new data available
+            // WebSocketTransport::PollResult pollResult = _ws.poll();
 
-        //     if (!firstConnectionAttempt && !_automaticReconnection)
-        //     {
-        //         // Do not attempt to reconnect
-        //         break;
-        //     }
+            // 3. Dispatch the incoming messages
+            // _ws.dispatch(
+            //     pollResult,
+            //     [this](const std::string& msg,
+            //            size_t wireSize,
+            //            bool decompressionError,
+            //            WebSocketTransport::MessageKind messageKind) {
+            //         WebSocketMessageType webSocketMessageType{WebSocketMessageType::Error};
+            //         switch (messageKind)
+            //         {
+            //             case WebSocketTransport::MessageKind::MSG_TEXT:
+            //             case WebSocketTransport::MessageKind::MSG_BINARY:
+            //             {
+            //                 webSocketMessageType = WebSocketMessageType::Message;
+            //             }
+            //             break;
 
-        //     firstConnectionAttempt = false;
+            //             case WebSocketTransport::MessageKind::PING:
+            //             {
+            //                 webSocketMessageType = WebSocketMessageType::Ping;
+            //             }
+            //             break;
 
-        //     // Only sleep if we are retrying
-        //     if (duration.count() > 0)
-        //     {
-        //         std::unique_lock<std::mutex> lock(_sleepMutex);
-        //         _sleepCondition.wait_for(lock, duration);
-        //     }
+            //             case WebSocketTransport::MessageKind::PONG:
+            //             {
+            //                 webSocketMessageType = WebSocketMessageType::Pong;
+            //             }
+            //             break;
 
-        //     if (_stop)
-        //     {
-        //         break;
-        //     }
+            //             case WebSocketTransport::MessageKind::FRAGMENT:
+            //             {
+            //                 webSocketMessageType = WebSocketMessageType::Fragment;
+            //             }
+            //             break;
+            //         }
 
-        //     // Try to connect synchronously
-        //     ix::WebSocketInitResult status = connect(_handshakeTimeoutSecs);
+            //         WebSocketErrorInfo webSocketErrorInfo;
+            //         webSocketErrorInfo.decompressionError = decompressionError;
 
-        //     if (!status.success)
-        //     {
-        //         WebSocketErrorInfo connectErr;
+            //         bool binary = messageKind == WebSocketTransport::MessageKind::MSG_BINARY;
 
-        //         if (_automaticReconnection)
-        //         {
-        //             duration =
-        //                 millis(calculateRetryWaitMilliseconds(retries++,
-        //                                                       _maxWaitBetweenReconnectionRetries,
-        //                                                       _minWaitBetweenReconnectionRetries));
+            //         _onMessageCallback(ix::make_unique<WebSocketMessage>(webSocketMessageType,
+            //                                                              msg,
+            //                                                              wireSize,
+            //                                                              webSocketErrorInfo,
+            //                                                              WebSocketOpenInfo(),
+            //                                                              WebSocketCloseInfo(),
+            //                                                              binary));
 
-        //             connectErr.wait_time = duration.count();
-        //             connectErr.retries = retries;
-        //         }
-
-        //         connectErr.reason = status.errorStr;
-        //         connectErr.http_status = status.http_status;
-
-        //         _onMessageCallback(ix::make_unique<WebSocketMessage>(WebSocketMessageType::Error,
-        //                                                              emptyMsg,
-        //                                                              0,
-        //                                                              connectErr,
-        //                                                              WebSocketOpenInfo(),
-        //                                                              WebSocketCloseInfo()));
-        //     }
-        // }
-    };
+            //         WebSocket::invokeTrafficTrackerCallback(wireSize, true);
+            //     });
+        }
+    }
 
     void start_websocket_connection(){
         std::string protocol, host;
@@ -755,23 +727,6 @@ public:
     };
 
     void set_on_message_callback(const std::function<void(const std::string&)>& callback);
-
-    void parse_url(std::string& protocol, std::string& host, int& port, const std::string& url) {
-        std::string::size_type pos = url.find("://");
-        if (pos == std::string::npos) {
-            throw std::runtime_error("invalid url");
-        }
-        protocol = url.substr(0, pos);
-        std::string::size_type pos2 = url.find(":", pos + 3);
-        if (pos2 == std::string::npos) {
-            throw std::runtime_error("invalid url");
-        }
-        host = url.substr(pos + 3, pos2 - pos - 3);
-        port = stoi(url.substr(pos2 + 1));
-        std::cout << "protocol: " << protocol << std::endl;
-        std::cout << "host: " << host << std::endl;
-        std::cout << "port: " << port << std::endl;
-    };
 private:
     std::string _url;
     std::unique_ptr<SecureSocket> _tls_socket;
@@ -780,14 +735,23 @@ private:
 
     std::vector<uint8_t> _send_buffer;
     mutable std::mutex _send_buffer_mutex;
+
+    std::vector<uint8_t> _receive_buffer;
+    mutable std::mutex _receive_buffer_mutex;
+
+    void close_socket() {
+        std::lock_guard<std::mutex> lock(_socket_mutex);
+        _tls_socket->ssl_close();
+    }
 };
 
 int main() {
-    WebSocketClient c("wss://ws-feed.exchange.coinbase.com:443");
+    CoinbaseWebSocketClient c("wss://ws-feed.exchange.coinbase.com:443");
     c.start_websocket_connection();
     std::string product_id = "BTC-USD";
     std::ostringstream ss;
     ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
     std::string msg = ss.str();
     c.send_text(msg);
+    c.poll();
 }
