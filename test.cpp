@@ -1,47 +1,19 @@
 #include <string>
 #include <functional>
-#include <unordered_map>
-#include <stdexcept>
 #include <iostream>
-#include <memory>
 #include <mutex>
-#include <atomic>
 #include <cstring>
 #include <thread>
-#include <fstream>
-#include <sstream>
 
-#include <openssl/bio.h>
-#include <openssl/conf.h>
 #include <openssl/err.h>
-#include <openssl/hmac.h>
 #include <openssl/ssl.h>
 #include <fnmatch.h>
 #include <netdb.h>
 #include <unistd.h>
-#include <netinet/tcp.h>
-#include <fcntl.h>
-#include <assert.h>
-#include <poll.h>
 #include <arpa/inet.h>
-
-#define socketerrno errno
-#define SOCKET_EAGAIN_EINPROGRESS EAGAIN
-#define SOCKET_EWOULDBLOCK EWOULDBLOCK
 
 typedef std::unordered_map<std::string, std::string> headers;
 typedef int socket_t;
-
-const std::string kDefaultCiphers =
-    "ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA-AES128-SHA "
-    "ECDHE-ECDSA-AES256-SHA ECDHE-ECDSA-AES128-SHA256 ECDHE-ECDSA-AES256-SHA384 "
-    "ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-AES256-GCM-SHA384 ECDHE-RSA-AES128-SHA "
-    "ECDHE-RSA-AES256-SHA ECDHE-RSA-AES128-SHA256 ECDHE-RSA-AES256-SHA384 "
-    "DHE-RSA-AES128-GCM-SHA256 DHE-RSA-AES256-GCM-SHA384 DHE-RSA-AES128-SHA "
-    "DHE-RSA-AES256-SHA DHE-RSA-AES128-SHA256 DHE-RSA-AES256-SHA256 AES128-SHA";
-
-using CancellationRequest = std::function<bool()>;
-using SelectInterruptPtr = std::unique_ptr<class SelectInterrupt>;
 
 struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string& err_msg) {
     struct addrinfo hints;
@@ -59,262 +31,25 @@ struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string&
     return res;
 };
 
-class SelectInterrupt {
+class SecureSocket {
 public:
-    SelectInterrupt() {};
-    ~SelectInterrupt() {};
-    
-    bool init(std::string& errorMsg) { return true; };
-    bool notify(uint64_t value) { return true; };
-    bool clear() { return true; };
-    uint64_t read() { return 0; };
-    int getFd() const { return -1; };
-    void* getEvent() const { return nullptr; };
-
-    // Used as special codes for pipe communication
-    static const uint64_t kSendRequest;
-    static const uint64_t kCloseRequest;
-};
-
-const uint64_t SelectInterrupt::kSendRequest = 1;
-const uint64_t SelectInterrupt::kCloseRequest = 2;
-
-class SelectInterruptPipe final : public SelectInterrupt {
-public:
-    SelectInterruptPipe() {
-        _fildes[kPipeReadIndex] = -1;
-        _fildes[kPipeWriteIndex] = -1;
-    }
-
-    ~SelectInterruptPipe() {
-        ::close(_fildes[kPipeReadIndex]);
-        ::close(_fildes[kPipeWriteIndex]);
-        _fildes[kPipeReadIndex] = -1;
-        _fildes[kPipeWriteIndex] = -1;
-    }
-
-    bool init(std::string& errorMsg) {
-        std::lock_guard<std::mutex> lock(_fildesMutex);
-        // calling init twice is a programming error
-        assert(_fildes[kPipeReadIndex] == -1);
-        assert(_fildes[kPipeWriteIndex] == -1);
-
-        if (pipe(_fildes) < 0) {
-            std::stringstream ss;
-            ss << "SelectInterruptPipe::init() failed in pipe() call"
-               << " : " << strerror(errno);
-            errorMsg = ss.str();
-            return false;
-        }
-
-        if (fcntl(_fildes[kPipeReadIndex], F_SETFL, O_NONBLOCK) == -1) {
-            std::stringstream ss;
-            ss << "SelectInterruptPipe::init() failed in fcntl(..., O_NONBLOCK) call"
-               << " : " << strerror(errno);
-            errorMsg = ss.str();
-
-            _fildes[kPipeReadIndex] = -1;
-            _fildes[kPipeWriteIndex] = -1;
-            return false;
-        }
-
-        if (fcntl(_fildes[kPipeWriteIndex], F_SETFL, O_NONBLOCK) == -1) {
-            std::stringstream ss;
-            ss << "SelectInterruptPipe::init() failed in fcntl(..., O_NONBLOCK) call"
-               << " : " << strerror(errno);
-            errorMsg = ss.str();
-
-            _fildes[kPipeReadIndex] = -1;
-            _fildes[kPipeWriteIndex] = -1;
-            return false;
-        }
-
-        return true;
-    }
-
-    bool notify(uint64_t value) {
-        std::lock_guard<std::mutex> lock(_fildesMutex);
-
-        int fd = _fildes[kPipeWriteIndex];
-        if (fd == -1) return false;
-
-        ssize_t ret = -1;
-        do{
-            ret = ::write(fd, &value, sizeof(value));
-        } while (ret == -1 && errno == EINTR);
-
-        // we should write 8 bytes for an uint64_t
-        return ret == 8;
-    }
-
-    uint64_t read() {
-        std::lock_guard<std::mutex> lock(_fildesMutex);
-        int fd = _fildes[kPipeReadIndex];
-        uint64_t value = 0;
-        ssize_t ret = -1;
-        do {
-            ret = ::read(fd, &value, sizeof(value));
-        } while (ret == -1 && errno == EINTR);
-        return value;
-    }
-
-    bool clear() {
-        return true;
-    }
-
-    int getFd() const {
-        std::lock_guard<std::mutex> lock(_fildesMutex);
-        return _fildes[kPipeReadIndex];
-    }
-
-private:
-    // Store file descriptors used by the communication pipe. Communication
-    // happens between a control thread and a background thread, which is
-    // blocked on select.
-    int _fildes[2];
-    mutable std::mutex _fildesMutex;
-
-    // Used to identify the read/write idx
-    static const int kPipeReadIndex;
-    static const int kPipeWriteIndex;
-};
-
-// File descriptor at index 0 in _fildes is the read end of the pipe
-// File descriptor at index 1 in _fildes is the write end of the pipe
-const int SelectInterruptPipe::kPipeReadIndex = 0;
-const int SelectInterruptPipe::kPipeWriteIndex = 1;
-
-SelectInterruptPtr create_select_interrupt() {
-    return std::unique_ptr<SelectInterruptPipe>(new SelectInterruptPipe());
-}
-
-struct SocketTLSOptions {
-public:
-    // check validity of the object
-    bool isValid() const
-    {
-        if (!_validated)
-        {
-            if (!certFile.empty() && !std::ifstream(certFile))
-            {
-                _errMsg = "certFile not found: " + certFile;
-                return false;
-            }
-            if (!keyFile.empty() && !std::ifstream(keyFile))
-            {
-                _errMsg = "keyFile not found: " + keyFile;
-                return false;
-            }
-            if (!caFile.empty() && caFile != kTLSCAFileDisableVerify &&
-                caFile != kTLSCAFileUseSystemDefaults && !std::ifstream(caFile))
-            {
-                _errMsg = "caFile not found: " + caFile;
-                return false;
-            }
-
-            if (certFile.empty() != keyFile.empty())
-            {
-                _errMsg = "certFile and keyFile must be both present, or both absent";
-                return false;
-            }
-
-            _validated = true;
-        }
-        return true;
-    };
-
-    // the certificate presented to peers
-    std::string certFile;
-
-    // the key used for signing/encryption
-    std::string keyFile;
-
-    // the ca certificate (or certificate bundle) file containing
-    // certificates to be trusted by peers; use 'SYSTEM' to
-    // leverage the system defaults, use 'NONE' to disable peer verification
-    std::string caFile = "SYSTEM";
-
-    // list of ciphers (rsa, etc...)
-    std::string ciphers = "DEFAULT";
-
-    // whether tls is enabled, used for server code
-    bool tls = false;
-
-    bool hasCertAndKey() const {
-        return !certFile.empty() && !keyFile.empty();
-    };
-
-    bool isUsingSystemDefaults() const {
-        return caFile == kTLSCAFileUseSystemDefaults;
-    };
-
-    bool isUsingInMemoryCAs() const {
-        return caFile.find(kTLSInMemoryMarker) != std::string::npos;
-    };
-
-    bool isPeerVerifyDisabled() const {
-        return caFile == kTLSCAFileDisableVerify;
-    };
-
-    bool isUsingDefaultCiphers() const {
-        return ciphers.empty() || ciphers == kTLSCiphersUseDefault;
-    }
-
-    const std::string& getErrorMsg() const {
-        return _errMsg;
-    };
-
-    std::string getDescription() const {
-        std::stringstream ss;
-        ss << "TLS Options:" << std::endl;
-        ss << "  certFile = " << certFile << std::endl;
-        ss << "  keyFile  = " << keyFile << std::endl;
-        ss << "  caFile   = " << caFile << std::endl;
-        ss << "  ciphers  = " << ciphers << std::endl;
-        ss << "  tls      = " << tls << std::endl;
-        return ss.str();
-    }
-
-private:
-    const char* kTLSCAFileUseSystemDefaults = "SYSTEM";
-    const char* kTLSCAFileDisableVerify = "NONE";
-    const char* kTLSCiphersUseDefault = "DEFAULT";
-    const char* kTLSInMemoryMarker = "-----BEGIN CERTIFICATE-----";
-
-    mutable std::string _errMsg;
-    mutable bool _validated = false;
-};
-
-enum class PollResultType
-{
-    ReadyForRead = 0,
-    ReadyForWrite = 1,
-    Timeout = 2,
-    Error = 3,
-    SendRequest = 4,
-    CloseRequest = 5
-};
-
-class SocketOpenSSL {
-public:
-    SocketOpenSSL(const SocketTLSOptions& tlsOptions, int fd = -1)
+    SecureSocket(int fd = -1)
         : _sockfd(fd)
         , _ssl_connection(nullptr)
-        , _ssl_context(nullptr)
-        , _tlsOptions(tlsOptions) {
-        std::call_once(_openSSLInitFlag, &SocketOpenSSL::openssl_initialize, this);
+        , _ssl_context(nullptr) {
+        std::call_once(_openssl_init_flag, &SecureSocket::openssl_initialize, this);
     }
 
-    ~SocketOpenSSL() {
+    ~SecureSocket() {
         ssl_close();
     };
 
     bool init(std::string& errorMsg) {
-        return _selectInterrupt->init(errorMsg);
+        return true;
     };
 
-    bool connect(const std::string& host, int port, std::string& err_msg) {
-        bool handshakeSuccessful = false;
+    bool ssl_connect(const std::string& host, int port, std::string& err_msg) {
+        bool handshake_successful = false;
         {
             std::lock_guard<std::mutex> lock(_mutex);
             if (!_openssl_initialization_successful) {
@@ -338,19 +73,13 @@ public:
             }
             SSL_set_fd(_ssl_connection, _sockfd);
 
-            // SNI support
             SSL_set_tlsext_host_name(_ssl_connection, host.c_str());
-
-            // Support for server name verification
-            // (The docs say that this should work from 1.0.2, and is the default from
-            // 1.1.0, but it does not. To be on the safe side, the manual test
-            // below is enabled for all versions prior to 1.1.0.)
             X509_VERIFY_PARAM* param = SSL_get0_param(_ssl_connection);
             X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
-            handshakeSuccessful = openssl_client_handshake(host, err_msg);
+            handshake_successful = openssl_client_handshake(host, err_msg);
         }
 
-        if (!handshakeSuccessful) {
+        if (!handshake_successful) {
             ssl_close();
             return false;
         }
@@ -420,25 +149,6 @@ private:
         _sockfd = -1;
     }
 
-    void socket_configure(int sockfd)
-    {
-        // 1. disable Nagle's algorithm
-        int flag = 1;
-        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char*) &flag, sizeof(flag));
-
-        // 2. make socket non blocking
-        fcntl(sockfd, F_SETFL, O_NONBLOCK);
-    }
-
-    bool is_wait_needed() {
-        int err = errno;
-        if (err == EWOULDBLOCK || err == EAGAIN || err == EINPROGRESS) {
-            return true;
-        }
-
-        return false;
-    }
-
     int connect_to_address(const struct addrinfo* address, std::string& err_msg) {
         err_msg = "no error";
         socket_t fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
@@ -447,123 +157,27 @@ private:
             return -1;
         }
 
-        // set the socket to non blocking mode
-        socket_configure(fd);
         int res = ::connect(fd, address->ai_addr, address->ai_addrlen);
-        if (res == -1 && !is_wait_needed())
-        {
+        if (res == -1) {
             err_msg = strerror(errno);
             ::close(fd);
             return -1;
         }
 
-        for (;;) {
-            int timeoutMs = 10;
-            bool readyToRead = false;
-            SelectInterruptPtr selectInterrupt = create_select_interrupt();
-            PollResultType pollResult = socket_poll(readyToRead, timeoutMs, fd, selectInterrupt);
-
-            if (pollResult == PollResultType::Timeout)
-            {
-                continue;
-            } else if (pollResult == PollResultType::Error) {
-                ::close(fd);
-                err_msg = std::string("Connect error: ") + strerror(errno);
-                return -1;
-            } else if (pollResult == PollResultType::ReadyForWrite) {
-                return fd;
-            } else {
-                ::close(fd);
-                err_msg = std::string("Connect error: ") + strerror(errno);
-                return -1;
-            }
-        }
-    }
-
-    int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
-        int ret = -1;
-        do
-        {
-            ret = ::poll(fds, nfds, timeout);
-        } while (ret == -1 && errno == EINTR);
-
-        return ret;
-    }
-
-    PollResultType socket_poll(bool readyToRead, int timeoutMs, int sockfd, const SelectInterruptPtr& selectInterrupt) {
-        PollResultType pollResult = PollResultType::ReadyForRead;
-        nfds_t nfds = 1;
-        struct pollfd fds[2];
-        memset(fds, 0, sizeof(fds));
-
-        fds[0].fd = sockfd;
-        fds[0].events = (readyToRead) ? POLLIN : POLLOUT;
-        int ret = poll(fds, nfds, timeoutMs);
-        if (ret < 0) {
-            pollResult = PollResultType::Error;
-        } else if (ret == 0) {
-            pollResult = PollResultType::Timeout;
-        } else if (sockfd != -1 && readyToRead && fds[0].revents & POLLIN) {
-            pollResult = PollResultType::ReadyForRead;
-        } else if (sockfd != -1 && !readyToRead && fds[0].revents & POLLOUT) {
-            pollResult = PollResultType::ReadyForWrite;
-            int optval = -1;
-            socklen_t optlen = sizeof(optval);
-
-            // getsockopt() puts the errno value for connect into optval so 0
-            // means no-error.
-            if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen) == -1 || optval != 0)
-            {
-                pollResult = PollResultType::Error;
-
-                // set errno to optval so that external callers can have an
-                // appropriate error description when calling strerror
-                errno = optval;
-            }
-        } else if (sockfd != -1 && (fds[0].revents & POLLERR || fds[0].revents & POLLHUP ||
-                                fds[0].revents & POLLNVAL)) {
-            pollResult = PollResultType::Error;
-        }
-
-        return pollResult;
-    }
-
-
-    bool read_select_interrupt_request(const SelectInterruptPtr& selectInterrupt, PollResultType* pollResult){
-        uint64_t value = selectInterrupt->read();
-
-        if (value == SelectInterrupt::kSendRequest) {
-            *pollResult = PollResultType::SendRequest;
-            return true;
-        } else if (value == SelectInterrupt::kCloseRequest) {
-            *pollResult = PollResultType::CloseRequest;
-            return true;
-        }
-
-        return false;
+        return fd;
     }
 
     int socket_connect(const std::string& hostname, int port, std::string& err_msg) {
-        //
-        // First do DNS resolution
-        //
         std::string dns_err_msg;
         struct addrinfo* res = resolve_dns(hostname, port, dns_err_msg);
         if (res == nullptr) {
             return -1;
         }
-
         int sockfd = -1;
-
-        // iterate through the records to find a working peer
         struct addrinfo* address;
         for (address = res; address != nullptr; address = address->ai_next) {
-            //
-            // Second try to connect to the remote host
-            //
             sockfd = connect_to_address(address, err_msg);
-            if (sockfd != -1)
-            {
+            if (sockfd != -1) {
                 break;
             }
         }
@@ -699,22 +313,16 @@ private:
     SSL* _ssl_connection;
     SSL_CTX* _ssl_context;
     const SSL_METHOD* _ssl_method;
-    SocketTLSOptions _tlsOptions;
 
-    std::vector<uint8_t> rxbuf;
-    std::vector<uint8_t> txbuf;
-
-    mutable std::mutex _mutex; // OpenSSL routines are not thread-safe
+    mutable std::mutex _mutex;
     std::mutex _socketMutex;
 
-    SelectInterruptPtr _selectInterrupt;
-
-    static std::once_flag _openSSLInitFlag;
+    static std::once_flag _openssl_init_flag;
     static std::atomic<bool> _openssl_initialization_successful;
 };
 
-std::once_flag SocketOpenSSL::_openSSLInitFlag;
-std::atomic<bool> SocketOpenSSL::_openssl_initialization_successful(false);
+std::once_flag SecureSocket::_openssl_init_flag;
+std::atomic<bool> SecureSocket::_openssl_initialization_successful(false);
 
 class WebSocketClient final {
 public:
@@ -877,8 +485,7 @@ public:
         const int max_redirections = 10;
         for (int i = 0; i < max_redirections; ++i) {
             std::string error_msg;
-            SocketTLSOptions tlsOptions;
-            _tls_socket = std::unique_ptr<SocketOpenSSL>(new SocketOpenSSL(tlsOptions, -1));
+            _tls_socket = std::unique_ptr<SecureSocket>(new SecureSocket(-1));
             if (!_tls_socket->init(error_msg)) {
                 _tls_socket.reset();
             }
@@ -942,7 +549,7 @@ public:
     };
 private:
     std::string m_url;
-    std::unique_ptr<SocketOpenSSL> _tls_socket;
+    std::unique_ptr<SecureSocket> _tls_socket;
 };
 
 int main() {
@@ -958,10 +565,9 @@ int main() {
     struct sockaddr_in* addr = (struct sockaddr_in *)address_info->ai_addr; 
     std::cout << "IP address: " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
 
-    SocketTLSOptions tlsOptions;
-    SocketOpenSSL s(tlsOptions, -1);
+    SecureSocket s(-1);
     std::string socket_err_msg;
-    bool ssl_connect_success = s.connect(host, port, socket_err_msg);
+    bool ssl_connect_success = s.ssl_connect(host, port, socket_err_msg);
     std::cout << "ssl connect success: " << std::boolalpha << ssl_connect_success << std::endl;
     std::cout << "socket err msg: " << socket_err_msg << std::endl;
 
