@@ -36,7 +36,7 @@ struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string&
 class SecureSocket {
 public:
     SecureSocket(){
-        std::call_once(_openssl_init_flag, &SecureSocket::openssl_initialize, this);
+        openssl_initialize();
     }
 
     ~SecureSocket() {
@@ -46,12 +46,7 @@ public:
     bool ssl_connect(const std::string& host, int port, std::string& err_msg) {
         bool handshake_successful = false;
         {
-            std::lock_guard<std::mutex> lock(_mutex);
-            if (!_openssl_initialization_successful) {
-                err_msg = "OPENSSL_init_ssl failure";
-                return false;
-            }
-
+            std::lock_guard<std::mutex> lock(_ssl_mutex);
             _sockfd = socket_connect(host, port, err_msg);
             if (_sockfd == -1) return false;
             _ssl_context = openssl_create_context(err_msg);
@@ -83,7 +78,7 @@ public:
     };
 
     void ssl_close() {
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::lock_guard<std::mutex> lock(_ssl_mutex);
         if (_ssl_connection != nullptr) {
             SSL_free(_ssl_connection);
             _ssl_connection = nullptr;
@@ -94,6 +89,7 @@ public:
         }
 
         socket_close();
+        std::cout << "closed ssl connection" << std::endl;
     };
 
     bool write_bytes(const std::string& str) {
@@ -116,7 +112,7 @@ public:
     }
 
     ssize_t send(char* buf, size_t nbyte){
-        std::lock_guard<std::mutex> lock(_mutex);
+        std::lock_guard<std::mutex> lock(_ssl_mutex);
         if (_ssl_connection == nullptr || _ssl_context == nullptr) {
             return 0;
         }
@@ -161,7 +157,7 @@ public:
 
     ssize_t receive(void* buf, size_t nbyte) {
         while (true) {
-            std::lock_guard<std::mutex> lock(_mutex);
+            std::lock_guard<std::mutex> lock(_ssl_mutex);
             if (_ssl_connection == nullptr || _ssl_context == nullptr) {
                 return 0;
             }
@@ -214,6 +210,8 @@ private:
         if (res == nullptr) {
             return -1;
         }
+        struct sockaddr_in* addr = (struct sockaddr_in *)res->ai_addr; 
+        std::cout << "resolved IP address " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
         int sockfd = -1;
         struct addrinfo* address;
         for (address = res; address != nullptr; address = address->ai_next) {
@@ -228,12 +226,12 @@ private:
     }
 
     void openssl_initialize() {
-        if (!OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, nullptr)) return;
-
+        if (!OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, nullptr)) {
+            throw std::runtime_error("cannot initialize openssl");
+        }
         (void) OpenSSL_add_ssl_algorithms();
         (void) SSL_load_error_strings();
-
-        _openssl_initialization_successful = true;
+        std::cout << "openssl initialized" << std::endl;
     };
 
     std::string get_ssl_error(int ret) {
@@ -327,15 +325,9 @@ private:
     SSL_CTX* _ssl_context = nullptr;
     const SSL_METHOD* _ssl_method;
 
-    mutable std::mutex _mutex;
+    mutable std::mutex _ssl_mutex;
     std::mutex _socket_mutex;
-
-    static std::once_flag _openssl_init_flag;
-    static std::atomic<bool> _openssl_initialization_successful;
 };
-
-std::once_flag SecureSocket::_openssl_init_flag;
-std::atomic<bool> SecureSocket::_openssl_initialization_successful(false);
 
 enum class ReadyState {
     CLOSING,
@@ -425,16 +417,15 @@ std::pair<bool, headers> read_and_parse_headers(std::unique_ptr<SecureSocket>& s
 
 class WebSocketClient final {
 public:
-    WebSocketClient() {
+    WebSocketClient(const std::string& url) :
+    _url(url),
+    _ready_state(ReadyState::CLOSED) {
     };
     ~WebSocketClient() {
     };
     void connect();
     void disconnect();
-    void set_url(const std::string& url) { m_url = url; };
-    void send(const std::string& message) {
-
-    };
+    void send(const std::string& message) {};
     void run() {
         // while (true)
         // {
@@ -574,11 +565,11 @@ public:
         // }
     };
 
-    void start_websocket_connection(const std::string& url, const headers& h, int timeout_secs){
+    void start_websocket_connection(){
         std::string protocol, host;
         int port;
-        std::string url_copy(url);
-        parse_url(protocol, host, port, url_copy);
+        std::string url(_url);
+        parse_url(protocol, host, port, url);
         if (protocol != "wss") {
             throw std::runtime_error("invalid protocol: " + protocol);
         }
@@ -591,6 +582,8 @@ public:
             ss << "unable to connect to " << host << " on port " << port << ", error: " << error_msg;
             throw std::runtime_error(ss.str());
         }
+
+        std::cout << "ssl connect succeeded" << std::endl;
 
         std::stringstream ss;
         ss << "GET / HTTP/1.1\r\n";
@@ -674,29 +667,12 @@ public:
         std::cout << "port: " << port << std::endl;
     };
 private:
-    std::string m_url;
+    std::string _url;
     std::unique_ptr<SecureSocket> _tls_socket;
     ReadyState _ready_state;
 };
 
 int main() {
-    WebSocketClient c;
-    std::string url("wss://ws-feed.exchange.coinbase.com:443");
-    c.set_url(url);
-    std::string protocol, host;
-    int port;
-    c.parse_url(protocol, host, port, url);
-
-    std::string dns_err_msg;
-    struct addrinfo* address_info = resolve_dns(host, port, dns_err_msg);
-    struct sockaddr_in* addr = (struct sockaddr_in *)address_info->ai_addr; 
-    std::cout << "IP address: " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
-
-    SecureSocket s;
-    std::string socket_err_msg;
-    bool ssl_connect_success = s.ssl_connect(host, port, socket_err_msg);
-    std::cout << "ssl connect success: " << std::boolalpha << ssl_connect_success << std::endl;
-    std::cout << "socket err msg: " << socket_err_msg << std::endl;
-
-    c.start_websocket_connection(url, headers(), 10);
+    WebSocketClient c("wss://ws-feed.exchange.coinbase.com:443");
+    c.start_websocket_connection();
 }
