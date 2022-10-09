@@ -2,6 +2,7 @@
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXUserAgent.h>
 #include <iostream>
+#include <sstream>
 
 int main() {
     ix::WebSocket webSocket;
@@ -35,10 +36,13 @@ int main() {
     );
 
     webSocket.start();
-    while (true) {
-        sleep(1);
-        webSocket.send("hello world");
-    }
+    sleep(1);
+    std::string product_id = "BTC-USD";
+    std::ostringstream ss;
+    ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
+    std::string msg = ss.str();
+    webSocket.send(msg);
+    sleep(10);
     webSocket.stop();
     return 0;
 }

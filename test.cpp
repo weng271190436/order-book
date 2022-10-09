@@ -25,6 +25,10 @@
 #include <poll.h>
 #include <arpa/inet.h>
 
+#define socketerrno errno
+#define SOCKET_EAGAIN_EINPROGRESS EAGAIN
+#define SOCKET_EWOULDBLOCK EWOULDBLOCK
+
 typedef std::unordered_map<std::string, std::string> headers;
 typedef int socket_t;
 
@@ -305,6 +309,10 @@ public:
         ssl_close();
     };
 
+    bool init(std::string& errorMsg) {
+        return _selectInterrupt->init(errorMsg);
+    };
+
     bool connect(const std::string& host, int port, std::string& err_msg) {
         bool handshakeSuccessful = false;
         {
@@ -472,18 +480,7 @@ private:
         }
     }
 
-    int poll(struct pollfd* fds, nfds_t nfds, int timeout, void** event) {
-        if (event && *event) *event = nullptr;
-
-        //
-        // It was reported that on Android poll can fail and return -1 with
-        // errno == EINTR, which should be a temp error and should typically
-        // be handled by retrying in a loop.
-        // Maybe we need to put all syscall / C functions in
-        // a new IXSysCalls.cpp and wrap them all.
-        //
-        // The style from libuv is as such.
-        //
+    int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
         int ret = -1;
         do
         {
@@ -495,81 +492,20 @@ private:
 
     PollResultType socket_poll(bool readyToRead, int timeoutMs, int sockfd, const SelectInterruptPtr& selectInterrupt) {
         PollResultType pollResult = PollResultType::ReadyForRead;
-
-        //
-        // We used to use ::select to poll but on Android 9 we get large fds out of
-        // ::connect which crash in FD_SET as they are larger than FD_SETSIZE. Switching
-        // to ::poll does fix that.
-        //
-        // However poll isn't as portable as select and has bugs on Windows, so we
-        // have a shim to fallback to select on those platforms. See
-        // https://github.com/mpv-player/mpv/pull/5203/files for such a select wrapper.
-        //
         nfds_t nfds = 1;
         struct pollfd fds[2];
         memset(fds, 0, sizeof(fds));
 
         fds[0].fd = sockfd;
         fds[0].events = (readyToRead) ? POLLIN : POLLOUT;
-
-        // this is ignored by poll, but our select based poll wrapper on Windows needs it
-        fds[0].events |= POLLERR;
-
-        // File descriptor used to interrupt select when needed
-        int interruptFd = -1;
-        void* interruptEvent = nullptr;
-        if (selectInterrupt)
-        {
-            interruptFd = selectInterrupt->getFd();
-            interruptEvent = selectInterrupt->getEvent();
-
-            if (interruptFd != -1)
-            {
-                nfds = 2;
-                fds[1].fd = interruptFd;
-                fds[1].events = POLLIN;
-            }
-            else if (interruptEvent == nullptr)
-            {
-                // Emulation mode: SelectInterrupt neither supports file descriptors nor events
-
-                // Check the selectInterrupt for requests before doing the poll().
-                if (read_select_interrupt_request(selectInterrupt, &pollResult))
-                {
-                    return pollResult;
-                }
-            }
-        }
-
-        void* event = interruptEvent; // ix::poll will set event to nullptr if it wasn't signaled
-        int ret = poll(fds, nfds, timeoutMs, &event);
-
-        if (ret < 0)
-        {
+        int ret = poll(fds, nfds, timeoutMs);
+        if (ret < 0) {
             pollResult = PollResultType::Error;
-        }
-        else if (ret == 0)
-        {
+        } else if (ret == 0) {
             pollResult = PollResultType::Timeout;
-            if (selectInterrupt && interruptFd == -1 && interruptEvent == nullptr)
-            {
-                // Emulation mode: SelectInterrupt neither supports fd nor events
-
-                // Check the selectInterrupt for requests
-                read_select_interrupt_request(selectInterrupt, &pollResult);
-            }
-        }
-        else if ((interruptFd != -1 && fds[1].revents & POLLIN) || (interruptEvent != nullptr && event != nullptr))
-        {
-            // The InterruptEvent was signaled
-            read_select_interrupt_request(selectInterrupt, &pollResult);
-        }
-        else if (sockfd != -1 && readyToRead && fds[0].revents & POLLIN)
-        {
+        } else if (sockfd != -1 && readyToRead && fds[0].revents & POLLIN) {
             pollResult = PollResultType::ReadyForRead;
-        }
-        else if (sockfd != -1 && !readyToRead && fds[0].revents & POLLOUT)
-        {
+        } else if (sockfd != -1 && !readyToRead && fds[0].revents & POLLOUT) {
             pollResult = PollResultType::ReadyForWrite;
             int optval = -1;
             socklen_t optlen = sizeof(optval);
@@ -584,10 +520,8 @@ private:
                 // appropriate error description when calling strerror
                 errno = optval;
             }
-        }
-        else if (sockfd != -1 && (fds[0].revents & POLLERR || fds[0].revents & POLLHUP ||
-                                fds[0].revents & POLLNVAL))
-        {
+        } else if (sockfd != -1 && (fds[0].revents & POLLERR || fds[0].revents & POLLHUP ||
+                                fds[0].revents & POLLNVAL)) {
             pollResult = PollResultType::Error;
         }
 
@@ -767,6 +701,9 @@ private:
     const SSL_METHOD* _ssl_method;
     SocketTLSOptions _tlsOptions;
 
+    std::vector<uint8_t> rxbuf;
+    std::vector<uint8_t> txbuf;
+
     mutable std::mutex _mutex; // OpenSSL routines are not thread-safe
     std::mutex _socketMutex;
 
@@ -779,11 +716,11 @@ private:
 std::once_flag SocketOpenSSL::_openSSLInitFlag;
 std::atomic<bool> SocketOpenSSL::_openssl_initialization_successful(false);
 
-class websocket_client final {
+class WebSocketClient final {
 public:
-    websocket_client() {
+    WebSocketClient() {
     };
-    ~websocket_client() {
+    ~WebSocketClient() {
     };
     void connect();
     void disconnect();
@@ -929,22 +866,23 @@ public:
     };
 
     void connect_to_url(const std::string& url, const headers& h, int timeout_secs){
-            std::string protocol, host;
-            int port;
-            std::string url_copy(url);
-            parse_url(protocol, host, port, url_copy);
-            if (protocol != "wss") {
-                throw std::runtime_error("Invalid protocol: " + protocol);
-            }
-        
-            const int max_redirections = 10;
-            for (int i = 0; i < max_redirections; ++i)
-            {
-
+        std::string protocol, host;
+        int port;
+        std::string url_copy(url);
+        parse_url(protocol, host, port, url_copy);
+        if (protocol != "wss") {
+            throw std::runtime_error("Invalid protocol: " + protocol);
+        }
+    
+        const int max_redirections = 10;
+        for (int i = 0; i < max_redirections; ++i) {
             std::string error_msg;
             SocketTLSOptions tlsOptions;
             _tls_socket = std::unique_ptr<SocketOpenSSL>(new SocketOpenSSL(tlsOptions, -1));
-    //         _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
+            if (!_tls_socket->init(error_msg)) {
+                _tls_socket.reset();
+            }
+            // _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
 
     //         if (!_socket)
     //         {
@@ -1008,10 +946,9 @@ private:
 };
 
 int main() {
-    websocket_client c;
+    WebSocketClient c;
     std::string url("wss://ws-feed.exchange.coinbase.com:443");
     c.set_url(url);
-
     std::string protocol, host;
     int port;
     c.parse_url(protocol, host, port, url);
@@ -1027,4 +964,6 @@ int main() {
     bool ssl_connect_success = s.connect(host, port, socket_err_msg);
     std::cout << "ssl connect success: " << std::boolalpha << ssl_connect_success << std::endl;
     std::cout << "socket err msg: " << socket_err_msg << std::endl;
+
+    c.connect_to_url(url, headers(), 10);
 }
