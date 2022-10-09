@@ -9,6 +9,33 @@
             "cwd": "${workspaceFolder}",
             "args": [],
             "stopAtEntry": false,
+        },
+        {
+            "name": "TLS Example Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/tlsexample",
+            "cwd": "${workspaceFolder}",
+            "args": ["443"],
+            "stopAtEntry": false,
+        },
+        {
+            "name": "IXWebSocket Example Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/ixwebsocket",
+            "cwd": "${workspaceFolder}",
+            "args": [],
+            "stopAtEntry": false,
+        },
+        {
+            "name": "Launch Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/test",
+            "cwd": "${workspaceFolder}",
+            "args": [],
+            "stopAtEntry": false,
         }
     ]
 }
