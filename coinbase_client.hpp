@@ -484,8 +484,6 @@ public:
     };
     ~CoinbaseWebSocketClient() {
     };
-    void connect();
-    void disconnect();
     void send_text(const std::string& message) {
         if (_ready_state != ReadyState::OPEN && _ready_state != ReadyState::CLOSING){
             throw std::runtime_error("web socket is not open or closing, current state: " + std::to_string(static_cast<int>(_ready_state)));
