@@ -86,6 +86,7 @@ public:
 
         return true;
     };
+
     void ssl_close() {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_ssl_connection != nullptr) {
@@ -143,7 +144,7 @@ public:
 
 private:
     void socket_close() {
-        std::lock_guard<std::mutex> lock(_socketMutex);
+        std::lock_guard<std::mutex> lock(_socket_mutex);
         if (_sockfd == -1) return;
         ::close(_sockfd);
         _sockfd = -1;
@@ -270,8 +271,7 @@ private:
     };
     bool openssl_check_server_cert(SSL* ssl, const std::string& hostname, std::string& err_msg) {
         X509* server_cert = SSL_get_peer_certificate(ssl);
-        if (server_cert == nullptr)
-        {
+        if (server_cert == nullptr) {
             err_msg = "OpenSSL failed - peer didn't present a X509 certificate.";
             return false;
         }
@@ -279,35 +279,6 @@ private:
         X509_free(server_cert);
         return true;
     };
-    bool check_host(const std::string& host, const char* pattern) {
-        return fnmatch(pattern, host.c_str(), 0) != FNM_NOMATCH;
-    }
-    bool openssl_server_handshake(std::string& err_msg) {
-        while (true) {
-            if (_ssl_connection == nullptr || _ssl_context == nullptr)
-            {
-                return false;
-            }
-
-            ERR_clear_error();
-            int accept_result = SSL_accept(_ssl_connection);
-            if (accept_result == 1) {
-                return true;
-            }
-            int reason = SSL_get_error(_ssl_connection, accept_result);
-            bool rc = false;
-            if (reason == SSL_ERROR_WANT_READ || reason == SSL_ERROR_WANT_WRITE) {
-                rc = true;
-            } else {
-                err_msg = get_ssl_error(accept_result);
-                rc = false;
-            }
-
-            if (!rc) {
-                return false;
-            }
-        }
-    }
 
     int _sockfd;
     SSL* _ssl_connection;
@@ -315,7 +286,7 @@ private:
     const SSL_METHOD* _ssl_method;
 
     mutable std::mutex _mutex;
-    std::mutex _socketMutex;
+    std::mutex _socket_mutex;
 
     static std::once_flag _openssl_init_flag;
     static std::atomic<bool> _openssl_initialization_successful;
