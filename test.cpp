@@ -424,7 +424,7 @@ public:
         return true;
     }
 
-    bool connect(const std::string& host, int port, std::string& errMsg, const CancellationRequest& isCancellationRequested) {
+    bool connect(const std::string& host, int port, std::string& errMsg) {
         bool handshakeSuccessful = false;
         {
             std::lock_guard<std::mutex> lock(_mutex);
@@ -433,7 +433,7 @@ public:
                 return false;
             }
 
-            _sockfd = socket_connect(host, port, errMsg, isCancellationRequested);
+            _sockfd = socket_connect(host, port, errMsg);
             if (_sockfd == -1) return false;
             _ssl_context = openSSLCreateContext(errMsg);
             if (_ssl_context == nullptr) {
@@ -462,7 +462,7 @@ public:
             // below is enabled for all versions prior to 1.1.0.)
             X509_VERIFY_PARAM* param = SSL_get0_param(_ssl_connection);
             X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
-            handshakeSuccessful = openSSLClientHandshake(host, errMsg, isCancellationRequested);
+            handshakeSuccessful = openSSLClientHandshake(host, errMsg);
         }
 
         if (!handshakeSuccessful) {
@@ -554,7 +554,7 @@ private:
         return false;
     }
 
-    int connect_to_address(const struct addrinfo* address, std::string& errMsg, const CancellationRequest& isCancellationRequested) {
+    int connect_to_address(const struct addrinfo* address, std::string& errMsg) {
         errMsg = "no error";
         socket_t fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd < 0) {
@@ -573,12 +573,6 @@ private:
         }
 
         for (;;) {
-            if (isCancellationRequested && isCancellationRequested()) {
-                ::close(fd);
-                errMsg = "Cancelled";
-                return -1;
-            }
-
             int timeoutMs = 10;
             bool readyToRead = false;
             SelectInterruptPtr selectInterrupt = createSelectInterrupt();
@@ -738,7 +732,7 @@ private:
         return false;
     }
 
-    int socket_connect(const std::string& hostname, int port, std::string& errMsg, const CancellationRequest& isCancellationRequested) {
+    int socket_connect(const std::string& hostname, int port, std::string& errMsg) {
         //
         // First do DNS resolution
         //
@@ -756,7 +750,7 @@ private:
             //
             // Second try to connect to the remote host
             //
-            sockfd = connect_to_address(address, errMsg, isCancellationRequested);
+            sockfd = connect_to_address(address, errMsg);
             if (sockfd != -1)
             {
                 break;
@@ -772,6 +766,8 @@ private:
 
         (void) OpenSSL_add_ssl_algorithms();
         (void) SSL_load_error_strings();
+
+        _openSSLInitializationSuccessful = true;
     };
     std::string getSSLError(int ret) {
         unsigned long e;
@@ -874,14 +870,9 @@ private:
 
         return success;
     };
-    bool openSSLClientHandshake(const std::string& hostname, std::string& errMsg, const CancellationRequest& cancellation_requested) {
+    bool openSSLClientHandshake(const std::string& hostname, std::string& errMsg) {
         while (true) {
             if (_ssl_connection == nullptr || _ssl_context == nullptr) {
-                return false;
-            }
-
-            if (cancellation_requested()) {
-                errMsg = "cancellation requested";
                 return false;
             }
 
@@ -1272,5 +1263,12 @@ int main() {
     std::string dns_err_msg;
     struct addrinfo* address_info = resolve_dns(host, port, dns_err_msg);
     struct sockaddr_in* addr = (struct sockaddr_in *)address_info->ai_addr; 
-    std::cout << "inet_ntoa(in_addr)sin = " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
+    std::cout << "IP address: " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
+
+    SocketTLSOptions tlsOptions;
+    SocketOpenSSL s(tlsOptions, -1);
+    std::string socket_err_msg;
+    bool ssl_connect_success = s.connect(host, port, socket_err_msg);
+    std::cout << "ssl connect success: " << std::boolalpha << ssl_connect_success << std::endl;
+    std::cout << "socket err msg: " << socket_err_msg << std::endl;
 }
