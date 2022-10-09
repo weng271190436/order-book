@@ -1,22 +1,11 @@
-#include <websocketpp/config/asio_client.hpp>
-#include <websocketpp/client.hpp>
+#include "coinbase_client.hpp"
+
 #include <nlohmann/json.hpp>
 #include <httpserver.hpp>
 
-#include <iostream>
 #include <set>
-#include <mutex>
-
-typedef websocketpp::client<websocketpp::config::asio_tls_client> client;
-typedef websocketpp::lib::shared_ptr<boost::asio::ssl::context> context_ptr;
-
-using websocketpp::lib::placeholders::_1;
-using websocketpp::lib::placeholders::_2;
-using websocketpp::lib::bind;
 
 using json = nlohmann::json;
-
-typedef websocketpp::config::asio_client::message_type::ptr message_ptr;
 
 const int MAX_DISPLAY_NUM = 10;
 const int DOUBLE_DISPLAY_PRECISION = 10;
@@ -53,101 +42,59 @@ void print_yellow_line(std::string text) {
     std::cout << "\033[33m" << text << "\033[0m" << std::endl;
 }
 
-void on_open(client* c, websocketpp::connection_hdl hdl) {
-    print_yellow_line("on open");
-    websocketpp::lib::error_code ec;
+void *start_order_book(void *arg) {
+    CoinbaseWebSocketClient c("wss://ws-feed.exchange.coinbase.com:443");
+    c.set_on_message_callback([](const std::string& msg) {
+        json message = json::parse(msg);
+        if (message["type"] == "snapshot") {
+            for (auto it = message["bids"].begin(); it != message["bids"].end(); ++it) {
+                bid_mutex.lock();
+                b.bids[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
+                bid_mutex.unlock();
+            }
+            for (auto it = message["asks"].begin(); it != message["asks"].end(); ++it) {
+                ask_mutex.lock();
+                b.asks[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
+                ask_mutex.unlock();
+            }
+        } else if (message["type"] == "l2update") {
+            for (auto it = message["changes"].begin(); it != message["changes"].end(); ++it) {
+                std::string side = it.value()[0].get<std::string>();
+                double price = std::stod(it.value()[1].get<std::string>());
+                double size = std::stod(it.value()[2].get<std::string>());
+                if (side == "buy") {
+                    bid_mutex.lock();
+                    if (size == 0) {
+                        b.bids.erase(price);
+                    } else {
+                        b.bids[price] = size;
+                    }
+                    bid_mutex.unlock();
+                } else if (side == "sell") {
+                    ask_mutex.lock();
+                    if (size == 0) {
+                        b.asks.erase(price);
+                    } else {
+                        b.asks[price] = size;
+                    }
+                    ask_mutex.unlock();
+                }
+            }
+        } else if (message["type"] == "heartbeat") {
+            print_yellow_line("heartbeat");
+        } else if (message["type"] == "subscriptions") {
+            print_yellow_line("subscriptions");
+        } else {
+            print_yellow_line("unknown message type");
+        }
+    });
+    c.start_websocket_connection();
     std::ostringstream ss;
     ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
     std::string msg = ss.str();
-    c->send(hdl, msg, websocketpp::frame::opcode::text, ec);
-    if (ec) {
-        std::cout << "send failed because: " << ec.message() << std::endl;
-    }
-}
-
-void on_message(client* c, websocketpp::connection_hdl hdl, message_ptr msg) {
-    json message = json::parse(msg->get_payload());
-    if (message["type"] == "snapshot") {
-        for (auto it = message["bids"].begin(); it != message["bids"].end(); ++it) {
-            bid_mutex.lock();
-            b.bids[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
-            bid_mutex.unlock();
-        }
-        for (auto it = message["asks"].begin(); it != message["asks"].end(); ++it) {
-            ask_mutex.lock();
-            b.asks[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
-            ask_mutex.unlock();
-        }
-    } else if (message["type"] == "l2update") {
-        for (auto it = message["changes"].begin(); it != message["changes"].end(); ++it) {
-            std::string side = it.value()[0].get<std::string>();
-            double price = std::stod(it.value()[1].get<std::string>());
-            double size = std::stod(it.value()[2].get<std::string>());
-            if (side == "buy") {
-                bid_mutex.lock();
-                if (size == 0) {
-                    b.bids.erase(price);
-                } else {
-                    b.bids[price] = size;
-                }
-                bid_mutex.unlock();
-            } else if (side == "sell") {
-                ask_mutex.lock();
-                if (size == 0) {
-                    b.asks.erase(price);
-                } else {
-                    b.asks[price] = size;
-                }
-                ask_mutex.unlock();
-            }
-        }
-    } else if (message["type"] == "heartbeat") {
-        print_yellow_line("heartbeat");
-    } else if (message["type"] == "subscriptions") {
-        print_yellow_line("subscriptions");
-    } else {
-        print_yellow_line("unknown message type");
-    }
-}
-
-context_ptr on_tls_init(client *c, websocketpp::connection_hdl hdl) {
-    context_ptr ctx(new boost::asio::ssl::context(boost::asio::ssl::context::tlsv1));
-
-    try {
-        ctx->set_options(boost::asio::ssl::context::default_workarounds |
-                            boost::asio::ssl::context::no_sslv2 |
-                            boost::asio::ssl::context::single_dh_use);
-    } catch (std::exception& e) {
-        std::cout << e.what() << std::endl;
-    }
-    return ctx;
-}
-
-void *start_order_book(void *arg) {
-    try {
-        client c;
-        std::string uri = "wss://ws-feed.exchange.coinbase.com:443";
-        // Set logging to be pretty verbose (everything except message payloads)
-        c.set_access_channels(websocketpp::log::alevel::all);
-        c.clear_access_channels(websocketpp::log::alevel::frame_payload);
-
-        c.init_asio();
-        c.set_tls_init_handler(bind(&on_tls_init, &c, ::_1));
-        c.set_open_handler(bind(&on_open, &c, ::_1));
-        c.set_message_handler(bind(&on_message,&c, ::_1, ::_2));
-
-        websocketpp::lib::error_code ec;
-        client::connection_ptr con = c.get_connection(uri, ec);
-        if (ec) {
-            std::cout << "could not create connection because: " << ec.message() << std::endl;
-            return NULL;
-        }
-        c.connect(con);
-        c.run();
-    } catch (websocketpp::exception const & e) {
-        std::cout << "websocket error: " << e.what() << std::endl;
-    } catch (json::type_error const & e) {
-        std::cout << "json type error: " << e.what() << std::endl;
+    c.send_text(msg);
+    while (true) {
+        c.poll();
     }
     return NULL;
 }

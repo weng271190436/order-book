@@ -732,12 +732,6 @@ private:
             throw std::runtime_error("reserved bits used");
         }
 
-        //
-        // Calculate payload length:
-        // 0-125 mean the payload is that long.
-        // 126 means that the following two bytes indicate the length,
-        // 127 means the next 8 bytes indicate the length.
-        //
         int i = 0;
         if (ws.N0 < 126) {
             ws.N = ws.N0;
@@ -802,19 +796,3 @@ private:
         _receive_buffer.erase(_receive_buffer.begin(), _receive_buffer.begin() + ws.header_size+(size_t)ws.N);
     }
 };
-
-int main() {
-    CoinbaseWebSocketClient c("wss://ws-feed.exchange.coinbase.com:443");
-    c.set_on_message_callback([](const std::string& message) {
-        std::cout << message << std::endl;
-    });
-    c.start_websocket_connection();
-    std::string product_id = "BTC-USD";
-    std::ostringstream ss;
-    ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
-    std::string msg = ss.str();
-    c.send_text(msg);
-    while (true) {
-        c.poll();
-    }
-}
