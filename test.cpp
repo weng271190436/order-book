@@ -211,7 +211,7 @@ private:
             return -1;
         }
         struct sockaddr_in* addr = (struct sockaddr_in *)res->ai_addr; 
-        std::cout << "resolved IP address " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
+        std::cout << "resolved ip address " << inet_ntoa((struct in_addr)addr->sin_addr) << std::endl;
         int sockfd = -1;
         struct addrinfo* address;
         for (address = res; address != nullptr; address = address->ai_next) {
@@ -340,6 +340,15 @@ enum class ReadyState {
     OPEN
 };
 
+enum OpcodeType{
+    CONTINUATION = 0x0,
+    TEXT_FRAME = 0x1,
+    BINARY_FRAME = 0x2,
+    CLOSE = 8,
+    PING = 9,
+    PONG = 0xa,
+};
+
 std::string trim(const std::string &s)
 {
     auto start = s.begin();
@@ -429,7 +438,94 @@ public:
     };
     void connect();
     void disconnect();
-    void send(const std::string& message) {};
+    void send_text(const std::string& message) {
+        if (_ready_state != ReadyState::OPEN && _ready_state != ReadyState::CLOSING){
+            throw std::runtime_error("web socket is not open or closing, current state: " + std::to_string(static_cast<int>(_ready_state)));
+        }
+        auto message_begin = message.cbegin();
+        auto message_end = message.cend();
+        {
+            std::lock_guard<std::mutex> lock(_send_buffer_mutex);
+            _send_buffer.reserve(message.size());
+        }
+
+        uint64_t message_size = static_cast<uint64_t>(message_end - message_begin);
+        const uint8_t masking_key[4] = { 0x12, 0x34, 0x56, 0x78 };
+        bool use_mask = true;
+        std::vector<uint8_t> header;
+        header.assign(2 + (message_size >= 126 ? 2 : 0) + (message_size >= 65536 ? 6 : 0) +
+                          (use_mask ? 4 : 0),
+                      0);
+        header[0] = OpcodeType::TEXT_FRAME;
+        header[0] |= 0x80;
+
+        if (message_size < 126) {
+            header[1] = (message_size & 0xff) | (use_mask ? 0x80 : 0);
+            if (use_mask) {
+                header[2] = masking_key[0];
+                header[3] = masking_key[1];
+                header[4] = masking_key[2];
+                header[5] = masking_key[3];
+            }
+        } else if (message_size < 65536) {
+            header[1] = 126 | (use_mask ? 0x80 : 0);
+            header[2] = (message_size >> 8) & 0xff;
+            header[3] = (message_size >> 0) & 0xff;
+            if (use_mask) {
+                header[4] = masking_key[0];
+                header[5] = masking_key[1];
+                header[6] = masking_key[2];
+                header[7] = masking_key[3];
+            }
+        } else {
+            header[1] = 127 | (use_mask ? 0x80 : 0);
+            header[2] = (message_size >> 56) & 0xff;
+            header[3] = (message_size >> 48) & 0xff;
+            header[4] = (message_size >> 40) & 0xff;
+            header[5] = (message_size >> 32) & 0xff;
+            header[6] = (message_size >> 24) & 0xff;
+            header[7] = (message_size >> 16) & 0xff;
+            header[8] = (message_size >> 8) & 0xff;
+            header[9] = (message_size >> 0) & 0xff;
+
+            if (use_mask) {
+                header[10] = masking_key[0];
+                header[11] = masking_key[1];
+                header[12] = masking_key[2];
+                header[13] = masking_key[3];
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(_send_buffer_mutex);
+            _send_buffer.insert(_send_buffer.end(), header.begin(), header.end());
+            _send_buffer.insert(_send_buffer.end(), message_begin, message_end);
+            if (use_mask) {
+                for (size_t i = 0; i != (size_t) message_size; ++i) {
+                    *(_send_buffer.end() - (size_t) message_size + i) ^= masking_key[i & 0x3];
+                }
+            }
+
+            while (_send_buffer.size()) {
+                ssize_t ret = 0;
+                {
+                    std::lock_guard<std::mutex> lock(_socket_mutex);
+                    ret = _tls_socket->send((char*) &_send_buffer[0], _send_buffer.size());
+                }
+                if (ret < 0){
+                    throw std::runtime_error("send failed with return code" + std::to_string(ret));
+                } else if (ret <= 0) {
+                    std::lock_guard<std::mutex> lock(_socket_mutex);
+                    _tls_socket->ssl_close();
+                    _ready_state = ReadyState::CLOSED;
+                } else {
+                    _send_buffer.erase(_send_buffer.begin(), _send_buffer.begin() + ret);
+                    std::cout << "sent " << ret << " bytes: " << message << std::endl;
+                }
+            }
+        }
+    };
+
     void run() {
         // while (true)
         // {
@@ -615,6 +711,8 @@ public:
         std::string version = http_version_status.first;
         int status = http_version_status.second;
 
+        std::cout << "version: " << version << ", status: " << status << std::endl;
+
         if (version != "HTTP/1.1") {
             std::stringstream ss;
             ss << "http version is not 1.1 but " << version << ", status: " << status
@@ -625,6 +723,10 @@ public:
         auto result = read_and_parse_headers(_tls_socket);
         auto headers_valid = result.first;
         auto headers = result.second;
+
+        for (auto& header : headers) {
+            std::cout << header.first << ": " << header.second << std::endl;
+        }
 
         if (!headers_valid){
             std::stringstream ss;
@@ -673,10 +775,19 @@ public:
 private:
     std::string _url;
     std::unique_ptr<SecureSocket> _tls_socket;
+    mutable std::mutex _socket_mutex;
     ReadyState _ready_state;
+
+    std::vector<uint8_t> _send_buffer;
+    mutable std::mutex _send_buffer_mutex;
 };
 
 int main() {
     WebSocketClient c("wss://ws-feed.exchange.coinbase.com:443");
     c.start_websocket_connection();
+    std::string product_id = "BTC-USD";
+    std::ostringstream ss;
+    ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
+    std::string msg = ss.str();
+    c.send_text(msg);
 }
