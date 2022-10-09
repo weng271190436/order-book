@@ -5,6 +5,7 @@
 #include <cstring>
 #include <thread>
 #include <sstream>
+#include <list>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -13,6 +14,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
 
 typedef std::unordered_map<std::string, std::string> headers;
 typedef int socket_t;
@@ -41,6 +43,17 @@ public:
 
     ~SecureSocket() {
         ssl_close();
+    };
+
+    void wait() {
+        int timeout = 100;
+        fd_set rfds;
+        fd_set wfds;
+        timeval tv = { timeout/1000, (timeout%1000) * 1000 };
+        FD_ZERO(&rfds);
+        FD_ZERO(&wfds);
+        FD_SET(_sockfd, &rfds);
+        select(_sockfd + 1, &rfds, &wfds, 0, &tv);
     };
 
     bool ssl_connect(const std::string& host, int port, std::string& err_msg) {
@@ -174,6 +187,10 @@ public:
             }
             return -1;
         }
+    };
+
+    void set_socket_non_blocking() {
+        fcntl(_sockfd, F_SETFL, O_NONBLOCK);
     };
 
 private:
@@ -462,7 +479,8 @@ class CoinbaseWebSocketClient final {
 public:
     CoinbaseWebSocketClient(const std::string& url) :
     _url(url),
-    _ready_state(ReadyState::CLOSED) {
+    _ready_state(ReadyState::CLOSED){
+        _readbuf.resize(32 * 1024);
     };
     ~CoinbaseWebSocketClient() {
     };
@@ -556,31 +574,18 @@ public:
     };
 
     void poll() {
+        _tls_socket->wait();
         {
             std::lock_guard<std::mutex> lock(_receive_buffer_mutex);
             while (true) {
-                int current_size = _receive_buffer.size();
-                ssize_t ret;
-                _receive_buffer.resize(current_size + 1500);
-                ret = _tls_socket->receive(&_receive_buffer[current_size], 1500);
-                if (ret < 0 && (errno == EWOULDBLOCK)) {
-                    _receive_buffer.resize(current_size);
+                ssize_t ret = _tls_socket->receive((char*) &_readbuf[0], _readbuf.size());
+                if (ret < 0) {
                     break;
                 } else if (ret <= 0) {
-                    _receive_buffer.resize(current_size);
                     close_socket();
-                    _ready_state = ReadyState::CLOSED;
-                    if (ret < 0) {
-                        throw std::runtime_error("connection error" + std::to_string(ret));
-                    }
-                    throw std::runtime_error("unexpected connection closed" + std::to_string(ret));
-                } else if (current_size > 65536) {
-                    std::cout << "received " << current_size + ret << " bytes" << std::endl;
-                    _receive_buffer.resize(current_size + ret);
-                    break;
+                    throw std::runtime_error("receive failed with return code" + std::to_string(ret));
                 } else {
-                    std::cout << "received " << ret << " bytes: " << std::string(_receive_buffer.begin() + current_size, _receive_buffer.end()) << std::endl;
-                    _receive_buffer.resize(current_size + ret);
+                    _receive_buffer.insert(_receive_buffer.end(), _readbuf.begin(), _readbuf.begin() + ret);
                 }
             }
         }
@@ -675,10 +680,15 @@ public:
         }
 
         _ready_state = ReadyState::OPEN;
+        _tls_socket->set_socket_non_blocking();
     };
 
-    void set_on_message_callback(const std::function<void(const std::string&)>& callback);
+    void set_on_message_callback(const std::function<void(const std::string&)> callback) {
+        _on_message_callback = callback;
+    };
 private:
+    std::function<void(const std::string&)> _on_message_callback;    
+
     std::string _url;
     std::unique_ptr<SecureSocket> _tls_socket;
     mutable std::mutex _socket_mutex;
@@ -689,6 +699,11 @@ private:
 
     std::vector<uint8_t> _receive_buffer;
     mutable std::mutex _receive_buffer_mutex;
+
+    std::vector<uint8_t> _readbuf;
+
+    // hold fragmented message
+    std::vector<uint8_t> _chunks;
 
     void close_socket() {
         std::lock_guard<std::mutex> lock(_socket_mutex);
@@ -759,26 +774,47 @@ private:
             ws.masking_key[3] = 0;
         }
 
-        // Prevent integer overflow in the next conditional
         const uint64_t max_frame_size(1ULL << 63);
         if (ws.N > max_frame_size) {
             throw std::runtime_error("frame too large");
         }
 
         if (_receive_buffer.size() < ws.header_size + ws.N) {
-            std::cout << "buffer size smaller than frame size" << std::endl;
             return;
         }
+
+        if (ws.mask) {
+            for (size_t j = 0; j != ws.N; ++j) {
+                _receive_buffer[j + ws.header_size] ^= ws.masking_key[j & 0x3];
+            }
+        }
+
+        if (ws.opcode == WebSocketHeader::TEXT_FRAME || ws.opcode == WebSocketHeader::BINARY_FRAME || ws.opcode == WebSocketHeader::CONTINUATION) {
+            _chunks.insert(_chunks.end(), _receive_buffer.begin()+ws.header_size, _receive_buffer.begin()+ws.header_size+(size_t)ws.N);
+            if (ws.fin) {
+                std::string full_message = std::string(_chunks.begin(), _chunks.end());
+                _on_message_callback(full_message);
+                _chunks.erase(_chunks.begin(), _chunks.end());
+                std::vector<uint8_t> ().swap(_chunks);
+            }
+        }
+
+        _receive_buffer.erase(_receive_buffer.begin(), _receive_buffer.begin() + ws.header_size+(size_t)ws.N);
     }
 };
 
 int main() {
     CoinbaseWebSocketClient c("wss://ws-feed.exchange.coinbase.com:443");
+    c.set_on_message_callback([](const std::string& message) {
+        std::cout << message << std::endl;
+    });
     c.start_websocket_connection();
     std::string product_id = "BTC-USD";
     std::ostringstream ss;
     ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
     std::string msg = ss.str();
     c.send_text(msg);
-    c.poll();
+    while (true) {
+        c.poll();
+    }
 }
