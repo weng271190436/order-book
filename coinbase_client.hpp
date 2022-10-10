@@ -6,6 +6,8 @@
 #include <thread>
 #include <sstream>
 #include <list>
+#include <unordered_map>
+#include <vector>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
