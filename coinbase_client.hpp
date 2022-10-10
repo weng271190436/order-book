@@ -709,88 +709,90 @@ private:
     }
 
     void read_buffer() {
-        WebSocketHeader ws;
-        if (_receive_buffer.size() < 2) return;
-        const uint8_t* data = (uint8_t*) &_receive_buffer[0];
-        ws.fin = (data[0] & 0x80) == 0x80;
-        ws.rsv1 = (data[0] & 0x40) == 0x40;
-        ws.rsv2 = (data[0] & 0x20) == 0x20;
-        ws.rsv3 = (data[0] & 0x10) == 0x10;
-        ws.opcode = (WebSocketHeader::OpcodeType)(data[0] & 0x0f);
-        ws.mask = (data[1] & 0x80) == 0x80;
-        ws.N0 = (data[1] & 0x7f);
-        ws.header_size =
-            2 + (ws.N0 == 126 ? 2 : 0) + (ws.N0 == 127 ? 8 : 0) + (ws.mask ? 4 : 0);
-        if (_receive_buffer.size() < ws.header_size) {
-            std::cout << "buffer size smaller than header size" << std::endl;
-            return;
-        }
-
-        if (ws.rsv1 || ws.rsv2 || ws.rsv3) {
-            throw std::runtime_error("reserved bits used");
-        }
-
-        int i = 0;
-        if (ws.N0 < 126) {
-            ws.N = ws.N0;
-            i = 2;
-        } else if (ws.N0 == 126) {
-            ws.N = 0;
-            ws.N |= ((uint64_t) data[2]) << 8;
-            ws.N |= ((uint64_t) data[3]) << 0;
-            i = 4;
-        } else if (ws.N0 == 127) {
-            ws.N = 0;
-            ws.N |= ((uint64_t) data[2]) << 56;
-            ws.N |= ((uint64_t) data[3]) << 48;
-            ws.N |= ((uint64_t) data[4]) << 40;
-            ws.N |= ((uint64_t) data[5]) << 32;
-            ws.N |= ((uint64_t) data[6]) << 24;
-            ws.N |= ((uint64_t) data[7]) << 16;
-            ws.N |= ((uint64_t) data[8]) << 8;
-            ws.N |= ((uint64_t) data[9]) << 0;
-            i = 10;
-        } else {
-            throw std::runtime_error("invalid payload length");
-        }
-
-        if (ws.mask) {
-            ws.masking_key[0] = ((uint8_t) data[i + 0]) << 0;
-            ws.masking_key[1] = ((uint8_t) data[i + 1]) << 0;
-            ws.masking_key[2] = ((uint8_t) data[i + 2]) << 0;
-            ws.masking_key[3] = ((uint8_t) data[i + 3]) << 0;
-        } else {
-            ws.masking_key[0] = 0;
-            ws.masking_key[1] = 0;
-            ws.masking_key[2] = 0;
-            ws.masking_key[3] = 0;
-        }
-
-        const uint64_t max_frame_size(1ULL << 63);
-        if (ws.N > max_frame_size) {
-            throw std::runtime_error("frame too large");
-        }
-
-        if (_receive_buffer.size() < ws.header_size + ws.N) {
-            return;
-        }
-
-        if (ws.mask) {
-            for (size_t j = 0; j != ws.N; ++j) {
-                _receive_buffer[j + ws.header_size] ^= ws.masking_key[j & 0x3];
+        while (true) {
+            WebSocketHeader ws;
+            if (_receive_buffer.size() < 2) return;
+            const uint8_t* data = (uint8_t*) &_receive_buffer[0];
+            ws.fin = (data[0] & 0x80) == 0x80;
+            ws.rsv1 = (data[0] & 0x40) == 0x40;
+            ws.rsv2 = (data[0] & 0x20) == 0x20;
+            ws.rsv3 = (data[0] & 0x10) == 0x10;
+            ws.opcode = (WebSocketHeader::OpcodeType)(data[0] & 0x0f);
+            ws.mask = (data[1] & 0x80) == 0x80;
+            ws.N0 = (data[1] & 0x7f);
+            ws.header_size =
+                2 + (ws.N0 == 126 ? 2 : 0) + (ws.N0 == 127 ? 8 : 0) + (ws.mask ? 4 : 0);
+            if (_receive_buffer.size() < ws.header_size) {
+                std::cout << "buffer size smaller than header size" << std::endl;
+                return;
             }
-        }
 
-        if (ws.opcode == WebSocketHeader::TEXT_FRAME || ws.opcode == WebSocketHeader::BINARY_FRAME || ws.opcode == WebSocketHeader::CONTINUATION) {
-            _chunks.insert(_chunks.end(), _receive_buffer.begin()+ws.header_size, _receive_buffer.begin()+ws.header_size+(size_t)ws.N);
-            if (ws.fin) {
-                std::string full_message = std::string(_chunks.begin(), _chunks.end());
-                _on_message_callback(full_message);
-                _chunks.erase(_chunks.begin(), _chunks.end());
-                std::vector<uint8_t> ().swap(_chunks);
+            if (ws.rsv1 || ws.rsv2 || ws.rsv3) {
+                throw std::runtime_error("reserved bits used");
             }
-        }
 
-        _receive_buffer.erase(_receive_buffer.begin(), _receive_buffer.begin() + ws.header_size+(size_t)ws.N);
+            int i = 0;
+            if (ws.N0 < 126) {
+                ws.N = ws.N0;
+                i = 2;
+            } else if (ws.N0 == 126) {
+                ws.N = 0;
+                ws.N |= ((uint64_t) data[2]) << 8;
+                ws.N |= ((uint64_t) data[3]) << 0;
+                i = 4;
+            } else if (ws.N0 == 127) {
+                ws.N = 0;
+                ws.N |= ((uint64_t) data[2]) << 56;
+                ws.N |= ((uint64_t) data[3]) << 48;
+                ws.N |= ((uint64_t) data[4]) << 40;
+                ws.N |= ((uint64_t) data[5]) << 32;
+                ws.N |= ((uint64_t) data[6]) << 24;
+                ws.N |= ((uint64_t) data[7]) << 16;
+                ws.N |= ((uint64_t) data[8]) << 8;
+                ws.N |= ((uint64_t) data[9]) << 0;
+                i = 10;
+            } else {
+                throw std::runtime_error("invalid payload length");
+            }
+
+            if (ws.mask) {
+                ws.masking_key[0] = ((uint8_t) data[i + 0]) << 0;
+                ws.masking_key[1] = ((uint8_t) data[i + 1]) << 0;
+                ws.masking_key[2] = ((uint8_t) data[i + 2]) << 0;
+                ws.masking_key[3] = ((uint8_t) data[i + 3]) << 0;
+            } else {
+                ws.masking_key[0] = 0;
+                ws.masking_key[1] = 0;
+                ws.masking_key[2] = 0;
+                ws.masking_key[3] = 0;
+            }
+
+            const uint64_t max_frame_size(1ULL << 63);
+            if (ws.N > max_frame_size) {
+                throw std::runtime_error("frame too large");
+            }
+
+            if (_receive_buffer.size() < ws.header_size + ws.N) {
+                return;
+            }
+
+            if (ws.mask) {
+                for (size_t j = 0; j != ws.N; ++j) {
+                    _receive_buffer[j + ws.header_size] ^= ws.masking_key[j & 0x3];
+                }
+            }
+
+            if (ws.opcode == WebSocketHeader::TEXT_FRAME || ws.opcode == WebSocketHeader::BINARY_FRAME || ws.opcode == WebSocketHeader::CONTINUATION) {
+                _chunks.insert(_chunks.end(), _receive_buffer.begin()+ws.header_size, _receive_buffer.begin()+ws.header_size+(size_t)ws.N);
+                if (ws.fin) {
+                    std::string full_message = std::string(_chunks.begin(), _chunks.end());
+                    _on_message_callback(full_message);
+                    _chunks.erase(_chunks.begin(), _chunks.end());
+                    std::vector<uint8_t> ().swap(_chunks);
+                }
+            }
+
+            _receive_buffer.erase(_receive_buffer.begin(), _receive_buffer.begin() + ws.header_size+(size_t)ws.N);
+        }
     }
 };

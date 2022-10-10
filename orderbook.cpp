@@ -81,7 +81,7 @@ void *start_order_book(void *arg) {
                 }
             }
         } else if (message["type"] == "heartbeat") {
-            print_yellow_line("heartbeat");
+            print_yellow_line("heartbeat" + message["time"].get<std::string>());
         } else if (message["type"] == "subscriptions") {
             print_yellow_line("subscriptions");
         } else {
