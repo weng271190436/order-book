@@ -6,6 +6,7 @@
 #include <set>
 #include <shared_mutex>
 #include <csignal>
+#include <future>
 
 using json = nlohmann::json;
 
@@ -237,5 +238,5 @@ int main(int argc, char* argv[]) {
         std::cout << "thread display book error: " << res << std::endl; 
     }
 
-    sleep(86400);
+    std::promise<void>().get_future().wait();
 }
