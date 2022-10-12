@@ -12,9 +12,9 @@ The main thread displays the order book at one-second interval.
 ## WebSocket Client Implementation
 - DNS resolution in `struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string& err_msg)`
 - Socket creation, secure connection open/close, socket read and write in `class SecureSocket`
-- `CoinbaseWebSocketClient::send_text` implements sending a text message to Coinbase websocket server
+- `CoinbaseWebSocketClient::send_message` implements sending a message to Coinbase websocket server
 - `CoinbaseWebSocketClient::poll` implements polling socket for new bytes and save them to receive buffer
-- `CoinbaseWebSocketClient::start_websocket_connection` implements opening a websocket connection
+- `CoinbaseWebSocketClient::start_connection` implements opening a websocket connection
 - `CoinbaseWebSocketClient::read_buffer` implements reading bytes into websocket messages
 
 ## Dependencies

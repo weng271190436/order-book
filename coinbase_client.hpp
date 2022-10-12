@@ -40,7 +40,7 @@ struct addrinfo* resolve_dns(const std::string& hostname, int port, std::string&
 class SecureSocket {
 public:
     SecureSocket(){
-        openssl_initialize();
+        ssl_init();
     }
 
     ~SecureSocket() {
@@ -64,7 +64,7 @@ public:
             std::lock_guard<std::mutex> lock(_ssl_mutex);
             _sockfd = socket_connect(host, port, err_msg);
             if (_sockfd == -1) return false;
-            _ssl_context = openssl_create_context(err_msg);
+            _ssl_context = ssl_create_context(err_msg);
             if (_ssl_context == nullptr) {
                 return false;
             }
@@ -81,7 +81,7 @@ public:
             SSL_set_tlsext_host_name(_ssl_connection, host.c_str());
             X509_VERIFY_PARAM* param = SSL_get0_param(_ssl_connection);
             X509_VERIFY_PARAM_set1_host(param, host.c_str(), host.size());
-            handshake_successful = openssl_client_handshake(host, err_msg);
+            handshake_successful = ssl_handshake(host, err_msg);
         }
 
         if (!handshake_successful) {
@@ -244,7 +244,7 @@ private:
         return sockfd;
     }
 
-    void openssl_initialize() {
+    void ssl_init() {
         if (!OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, nullptr)) {
             throw std::runtime_error("cannot initialize openssl");
         }
@@ -285,7 +285,7 @@ private:
         }
     };
 
-    SSL_CTX* openssl_create_context(std::string& err_msg) {
+    SSL_CTX* ssl_create_context(std::string& err_msg) {
         const SSL_METHOD* method = SSLv23_client_method();
         if (method == nullptr) {
             err_msg = "SSLv23_client_method failure";
@@ -303,7 +303,7 @@ private:
         return ctx;
     }
 
-    bool openssl_client_handshake(const std::string& hostname, std::string& err_msg) {
+    bool ssl_handshake(const std::string& hostname, std::string& err_msg) {
         while (true) {
             if (_ssl_connection == nullptr || _ssl_context == nullptr) {
                 return false;
@@ -312,7 +312,7 @@ private:
             ERR_clear_error();
             int connect_result = SSL_connect(_ssl_connection);
             if (connect_result == 1) {
-                return openssl_check_server_cert(_ssl_connection, hostname, err_msg);
+                return ssl_check_server_cert(_ssl_connection, hostname, err_msg);
             }
             int reason = SSL_get_error(_ssl_connection, connect_result);
             bool rc = false;
@@ -328,7 +328,8 @@ private:
             }
         }
     };
-    bool openssl_check_server_cert(SSL* ssl, const std::string& hostname, std::string& err_msg) {
+
+    bool ssl_check_server_cert(SSL* ssl, const std::string& hostname, std::string& err_msg) {
         X509* server_cert = SSL_get_peer_certificate(ssl);
         if (server_cert == nullptr) {
             err_msg = "openssl failed - server didn't present a X509 certificate.";
@@ -353,9 +354,7 @@ private:
 };
 
 enum class ReadyState {
-    CLOSING,
     CLOSED,
-    CONNECTING,
     OPEN
 };
 
@@ -366,8 +365,7 @@ struct WebSocketHeader {
     bool rsv2;
     bool rsv3;
     bool mask;
-    enum OpcodeType
-    {
+    enum OpcodeType {
         CONTINUATION = 0x0,
         TEXT_FRAME = 0x1,
         BINARY_FRAME = 0x2,
@@ -378,6 +376,10 @@ struct WebSocketHeader {
     int N0;
     uint64_t N;
     uint8_t masking_key[4];
+};
+
+struct WebSocketCloseCode {
+    static const uint16_t NORMAL = 1000;
 };
 
 std::string trim(const std::string &s)
@@ -485,92 +487,10 @@ public:
         _readbuf.resize(32 * 1024);
     };
     ~CoinbaseWebSocketClient() {
+        close();
     };
     void send_text(const std::string& message) {
-        if (_ready_state != ReadyState::OPEN && _ready_state != ReadyState::CLOSING){
-            throw std::runtime_error("web socket is not open or closing, current state: " + std::to_string(static_cast<int>(_ready_state)));
-        }
-        auto message_begin = message.cbegin();
-        auto message_end = message.cend();
-        {
-            std::lock_guard<std::mutex> lock(_send_buffer_mutex);
-            _send_buffer.reserve(message.size());
-        }
-
-        uint64_t message_size = static_cast<uint64_t>(message_end - message_begin);
-        const uint8_t masking_key[4] = { 0x12, 0x34, 0x56, 0x78 };
-        bool use_mask = true;
-        std::vector<uint8_t> header;
-        header.assign(2 + (message_size >= 126 ? 2 : 0) + (message_size >= 65536 ? 6 : 0) +
-                          (use_mask ? 4 : 0),
-                      0);
-        header[0] = WebSocketHeader::OpcodeType::TEXT_FRAME;
-        header[0] |= 0x80;
-
-        if (message_size < 126) {
-            header[1] = (message_size & 0xff) | (use_mask ? 0x80 : 0);
-            if (use_mask) {
-                header[2] = masking_key[0];
-                header[3] = masking_key[1];
-                header[4] = masking_key[2];
-                header[5] = masking_key[3];
-            }
-        } else if (message_size < 65536) {
-            header[1] = 126 | (use_mask ? 0x80 : 0);
-            header[2] = (message_size >> 8) & 0xff;
-            header[3] = (message_size >> 0) & 0xff;
-            if (use_mask) {
-                header[4] = masking_key[0];
-                header[5] = masking_key[1];
-                header[6] = masking_key[2];
-                header[7] = masking_key[3];
-            }
-        } else {
-            header[1] = 127 | (use_mask ? 0x80 : 0);
-            header[2] = (message_size >> 56) & 0xff;
-            header[3] = (message_size >> 48) & 0xff;
-            header[4] = (message_size >> 40) & 0xff;
-            header[5] = (message_size >> 32) & 0xff;
-            header[6] = (message_size >> 24) & 0xff;
-            header[7] = (message_size >> 16) & 0xff;
-            header[8] = (message_size >> 8) & 0xff;
-            header[9] = (message_size >> 0) & 0xff;
-
-            if (use_mask) {
-                header[10] = masking_key[0];
-                header[11] = masking_key[1];
-                header[12] = masking_key[2];
-                header[13] = masking_key[3];
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(_send_buffer_mutex);
-            _send_buffer.insert(_send_buffer.end(), header.begin(), header.end());
-            _send_buffer.insert(_send_buffer.end(), message_begin, message_end);
-            if (use_mask) {
-                for (size_t i = 0; i != (size_t) message_size; ++i) {
-                    *(_send_buffer.end() - (size_t) message_size + i) ^= masking_key[i & 0x3];
-                }
-            }
-
-            while (_send_buffer.size()) {
-                ssize_t ret = 0;
-                {
-                    std::lock_guard<std::mutex> lock(_socket_mutex);
-                    ret = _tls_socket->send((char*) &_send_buffer[0], _send_buffer.size());
-                }
-                if (ret < 0){
-                    throw std::runtime_error("send failed with return code" + std::to_string(ret));
-                } else if (ret <= 0) {
-                    close_socket();
-                    _ready_state = ReadyState::CLOSED;
-                } else {
-                    _send_buffer.erase(_send_buffer.begin(), _send_buffer.begin() + ret);
-                    std::cout << "sent " << ret << " bytes: " << message << std::endl;
-                }
-            }
-        }
+        send_message(WebSocketHeader::OpcodeType::TEXT_FRAME, message);
     };
 
     void poll() {
@@ -582,7 +502,7 @@ public:
                 if (ret < 0) {
                     break;
                 } else if (ret <= 0) {
-                    close_socket();
+                    _tls_socket->ssl_close();
                     throw std::runtime_error("receive failed with return code" + std::to_string(ret));
                 } else {
                     _receive_buffer.insert(_receive_buffer.end(), _readbuf.begin(), _readbuf.begin() + ret);
@@ -593,7 +513,7 @@ public:
         read_buffer();
     }
 
-    void start_websocket_connection(){
+    void start_connection(){
         std::string protocol, host;
         int port;
         std::string url(_url);
@@ -705,9 +625,100 @@ private:
     // hold fragmented message
     std::vector<uint8_t> _chunks;
 
-    void close_socket() {
-        std::lock_guard<std::mutex> lock(_socket_mutex);
-        _tls_socket->ssl_close();
+    void send_message(WebSocketHeader::OpcodeType opcode, const std::string& message) {
+        if (_ready_state != ReadyState::OPEN){
+            throw std::runtime_error("web socket is not open, current state: " + std::to_string(static_cast<int>(_ready_state)));
+        }
+        auto message_begin = message.cbegin();
+        auto message_end = message.cend();
+        {
+            std::lock_guard<std::mutex> lock(_send_buffer_mutex);
+            _send_buffer.reserve(message.size());
+        }
+
+        uint64_t message_size = static_cast<uint64_t>(message_end - message_begin);
+        const uint8_t masking_key[4] = { 0x12, 0x34, 0x56, 0x78 };
+        bool use_mask = true;
+        std::vector<uint8_t> header;
+        header.assign(2 + (message_size >= 126 ? 2 : 0) + (message_size >= 65536 ? 6 : 0) +
+                          (use_mask ? 4 : 0),
+                      0);
+        header[0] = opcode;
+        header[0] |= 0x80;
+
+        if (message_size < 126) {
+            header[1] = (message_size & 0xff) | (use_mask ? 0x80 : 0);
+            if (use_mask) {
+                header[2] = masking_key[0];
+                header[3] = masking_key[1];
+                header[4] = masking_key[2];
+                header[5] = masking_key[3];
+            }
+        } else if (message_size < 65536) {
+            header[1] = 126 | (use_mask ? 0x80 : 0);
+            header[2] = (message_size >> 8) & 0xff;
+            header[3] = (message_size >> 0) & 0xff;
+            if (use_mask) {
+                header[4] = masking_key[0];
+                header[5] = masking_key[1];
+                header[6] = masking_key[2];
+                header[7] = masking_key[3];
+            }
+        } else {
+            header[1] = 127 | (use_mask ? 0x80 : 0);
+            header[2] = (message_size >> 56) & 0xff;
+            header[3] = (message_size >> 48) & 0xff;
+            header[4] = (message_size >> 40) & 0xff;
+            header[5] = (message_size >> 32) & 0xff;
+            header[6] = (message_size >> 24) & 0xff;
+            header[7] = (message_size >> 16) & 0xff;
+            header[8] = (message_size >> 8) & 0xff;
+            header[9] = (message_size >> 0) & 0xff;
+
+            if (use_mask) {
+                header[10] = masking_key[0];
+                header[11] = masking_key[1];
+                header[12] = masking_key[2];
+                header[13] = masking_key[3];
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(_send_buffer_mutex);
+            _send_buffer.insert(_send_buffer.end(), header.begin(), header.end());
+            _send_buffer.insert(_send_buffer.end(), message_begin, message_end);
+            if (use_mask) {
+                for (size_t i = 0; i != (size_t) message_size; ++i) {
+                    *(_send_buffer.end() - (size_t) message_size + i) ^= masking_key[i & 0x3];
+                }
+            }
+
+            while (_send_buffer.size()) {
+                ssize_t ret = 0;
+                {
+                    std::lock_guard<std::mutex> lock(_socket_mutex);
+                    ret = _tls_socket->send((char*) &_send_buffer[0], _send_buffer.size());
+                }
+                if (ret < 0){
+                    throw std::runtime_error("send failed with return code" + std::to_string(ret));
+                } else if (ret <= 0) {
+                    _tls_socket->ssl_close();
+                    _ready_state = ReadyState::CLOSED;
+                } else {
+                    _send_buffer.erase(_send_buffer.begin(), _send_buffer.begin() + ret);
+                    std::cout << "sent " << ret << " bytes: " << message << std::endl;
+                }
+            }
+        }
+    }
+
+    void close() {
+        std::string reason = "normal closure";
+        std::string close_message {(char) (WebSocketCloseCode::NORMAL >> 8), (char) (WebSocketCloseCode::NORMAL & 0xff)};
+        close_message.append(reason);
+        send_message(WebSocketHeader::CLOSE, close_message);
+        _ready_state = ReadyState::CLOSED;
+        std::cout << "closed websocket" << std::endl;
     }
 
     void read_buffer() {

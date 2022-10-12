@@ -4,6 +4,8 @@
 #include <httpserver.hpp>
 
 #include <set>
+#include <shared_mutex>
+#include <csignal>
 
 using json = nlohmann::json;
 
@@ -19,6 +21,8 @@ order_book b;
 std::string product_id = "BTC-USD";
 std::mutex bid_mutex;
 std::mutex ask_mutex;
+bool is_running = true;
+std::shared_mutex is_running_mutex;
 
 std::string double_to_string(double d) {
     std::string s;
@@ -48,14 +52,12 @@ void *start_order_book(void *arg) {
         json message = json::parse(msg);
         if (message["type"] == "snapshot") {
             for (auto it = message["bids"].begin(); it != message["bids"].end(); ++it) {
-                bid_mutex.lock();
+                std::lock_guard<std::mutex> lock(bid_mutex);
                 b.bids[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
-                bid_mutex.unlock();
             }
             for (auto it = message["asks"].begin(); it != message["asks"].end(); ++it) {
-                ask_mutex.lock();
+                std::lock_guard<std::mutex> lock(ask_mutex);
                 b.asks[std::stod(it.value()[0].get<std::string>())] = std::stod(it.value()[1].get<std::string>());
-                ask_mutex.unlock();
             }
         } else if (message["type"] == "l2update") {
             for (auto it = message["changes"].begin(); it != message["changes"].end(); ++it) {
@@ -63,37 +65,41 @@ void *start_order_book(void *arg) {
                 double price = std::stod(it.value()[1].get<std::string>());
                 double size = std::stod(it.value()[2].get<std::string>());
                 if (side == "buy") {
-                    bid_mutex.lock();
+                    std::lock_guard<std::mutex> lock(bid_mutex);
                     if (size == 0) {
                         b.bids.erase(price);
                     } else {
                         b.bids[price] = size;
                     }
-                    bid_mutex.unlock();
                 } else if (side == "sell") {
-                    ask_mutex.lock();
+                    std::lock_guard<std::mutex> lock(ask_mutex);
                     if (size == 0) {
                         b.asks.erase(price);
                     } else {
                         b.asks[price] = size;
                     }
-                    ask_mutex.unlock();
                 }
             }
         } else if (message["type"] == "heartbeat") {
-            print_yellow_line("heartbeat" + message["time"].get<std::string>());
+            print_yellow_line("heartbeat " + message["time"].get<std::string>());
         } else if (message["type"] == "subscriptions") {
             print_yellow_line("subscriptions");
         } else {
             print_yellow_line("unknown message type");
         }
     });
-    c.start_websocket_connection();
+    c.start_connection();
     std::ostringstream ss;
     ss << "{ \"type\": \"subscribe\", \"channels\": [ { \"name\": \"heartbeat\", \"product_ids\": [ \"" << product_id << "\" ] }, { \"name\": \"level2\", \"product_ids\": [ \"" << product_id << "\" ] } ] }";
     std::string msg = ss.str();
     c.send_text(msg);
     while (true) {
+        {
+            std::shared_lock<std::shared_mutex> lock(is_running_mutex);
+            if (!is_running) {
+                break;
+            }
+        }
         c.poll();
     }
     return NULL;
@@ -102,24 +108,26 @@ void *start_order_book(void *arg) {
 void display_order_book() {
     int display_num = MAX_DISPLAY_NUM;
     print_green_line(product_id + " bids");
-    bid_mutex.lock();
-    for (auto it = b.bids.begin(); it != b.bids.end(); ++it) {
-        if (display_num-- == 0) {
-            break;
+    {
+        std::lock_guard<std::mutex> lock(bid_mutex);
+        for (auto it = b.bids.begin(); it != b.bids.end(); ++it) {
+            if (display_num-- == 0) {
+                break;
+            }
+            print_green_line(double_to_string(it->first) + " " + double_to_string(it->second));
         }
-        print_green_line(double_to_string(it->first) + " " + double_to_string(it->second));
     }
-    bid_mutex.unlock();
     display_num = MAX_DISPLAY_NUM;
     print_red_line(product_id + " asks");
-    ask_mutex.lock();
-    for (auto it = b.asks.begin(); it != b.asks.end(); ++it) {
-        if (display_num-- == 0) {
-            break;
+    {
+        std::lock_guard<std::mutex> lock(ask_mutex);
+        for (auto it = b.asks.begin(); it != b.asks.end(); ++it) {
+            if (display_num-- == 0) {
+                break;
+            }
+            print_red_line(double_to_string(it->first) + " " + double_to_string(it->second));
         }
-        print_red_line(double_to_string(it->first) + " " + double_to_string(it->second));
     }
-    ask_mutex.unlock();
 }
 
 std::string get_order_book_string() {
@@ -127,25 +135,27 @@ std::string get_order_book_string() {
     std::stringstream sstream;
     int display_num = MAX_DISPLAY_NUM;
     sstream << product_id << " bids\n--------------------" << std::endl;
-    bid_mutex.lock();
-    for (auto it = b.bids.begin(); it != b.bids.end(); ++it) {
-        if (display_num-- == 0) {
-            break;
+    {
+        std::lock_guard<std::mutex> lock(bid_mutex);
+        for (auto it = b.bids.begin(); it != b.bids.end(); ++it) {
+            if (display_num-- == 0) {
+                break;
+            }
+            sstream << double_to_string(it->first) << " " << double_to_string(it->second) << std::endl;
         }
-        sstream << double_to_string(it->first) << " " << double_to_string(it->second) << std::endl;
     }
-    bid_mutex.unlock();
     sstream << std::endl;
     display_num = MAX_DISPLAY_NUM;
     sstream << product_id << " asks\n--------------------" << std::endl;
-    ask_mutex.lock();
-    for (auto it = b.asks.begin(); it != b.asks.end(); ++it) {
-        if (display_num-- == 0) {
-            break;
+    {
+        std::lock_guard<std::mutex> lock(ask_mutex);
+        for (auto it = b.asks.begin(); it != b.asks.end(); ++it) {
+            if (display_num-- == 0) {
+                break;
+            }
+            sstream << double_to_string(it->first) << " " << double_to_string(it->second) << std::endl;
         }
-        sstream << double_to_string(it->first) << " " << double_to_string(it->second) << std::endl;
     }
-    ask_mutex.unlock();
     sstream << std::endl;
     s = sstream.str();
     return s;
@@ -162,14 +172,52 @@ void *start_http_server(void *arg) {
     httpserver::webserver ws = httpserver::create_webserver(8080);
     order_book_resource obr;
     ws.register_resource("/orderbook", &obr);
-    ws.start(true);
+    ws.start(false);
+    while (true) {
+        {
+            std::shared_lock<std::shared_mutex> lock(is_running_mutex);
+            if (!is_running) {
+                std::cout << "stopping http server" << std::endl;
+                ws.stop();
+                break;
+            }
+        }
+        sleep(0.1);
+    }
     return NULL;
+}
+
+void *display_book(void *arg) {
+    while (true) {
+        {
+            std::shared_lock<std::shared_mutex> lock(is_running_mutex);
+            if (!is_running) {
+                std::cout << "stopping display order book" << std::endl;
+                break;
+            }
+        }
+        sleep(1);
+        display_order_book();
+    }
+    return NULL;
+}
+
+void signal_handler(int signum) {
+    std::cout << "Interrupt signal (" << signum << ") received." << std::endl;
+    {
+        std::lock_guard<std::shared_mutex> lock(is_running_mutex);
+        is_running = false;
+    }
+    sleep(1.1);
+    exit(signum);  
 }
 
 int main(int argc, char* argv[]) {
     if (argc == 2) {
         product_id = argv[1];
     }
+
+    signal(SIGINT, signal_handler);
 
     pthread_t t_order_book;
     int res = pthread_create(&t_order_book, NULL, start_order_book, NULL);
@@ -183,8 +231,11 @@ int main(int argc, char* argv[]) {
         std::cout << "thread http server error: " << res << std::endl; 
     }
 
-    while (true) {
-        sleep(1);
-        display_order_book();
+    pthread_t t_display_book;
+    res = pthread_create(&t_display_book, NULL, display_book, NULL);
+    if (res) {
+        std::cout << "thread display book error: " << res << std::endl; 
     }
+
+    sleep(86400);
 }
